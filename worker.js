@@ -117,7 +117,8 @@ async function checkAuth(request, env) {
   const match = cookie.match(/app_token=([^;]+)/);
   if (!match) return false;
   const token = match[1];
-  if (!env.APP_KV) return token === 'no-kv-mode';
+  // Without KV: accept any non-empty token (session is cookie-only)
+  if (!env.APP_KV) return token.length > 8;
   const session = await env.APP_KV.get('session:' + token);
   return !!session;
 }
