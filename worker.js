@@ -169,7 +169,7 @@ function generateSubContent(sub, settings, host) {
 
   if (sub.protocols?.vless !== false) {
     links.push(generateVlessLink(host, settings.uuid, port, path, remark, proxyIP));
-    for (const ip of cleanIPs.slice(0, 5)) {
+    for (const ip of cleanIPs) {
       links.push(generateVlessLink(host, settings.uuid, port, path, remark + '-' + ip, ip));
     }
   }
