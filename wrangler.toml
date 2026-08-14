@@ -1,8 +1,16 @@
-name = "sinapanel"
+name = "app-panel"
 main = "worker.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-[[kv_namespaces]]
-binding = "APP_KV"
-id = "d922e1eee9af42f5beb3fa5104c9c10b"
+# Uncomment and set your KV namespace after creating it:
+# [[kv_namespaces]]
+# binding = "APP_KV"
+# id = "your_kv_namespace_id"
+
+# Optional environment variables (can also set in dashboard):
+# [vars]
+# PASSWORD = "123456"
+# UUID = "your-uuid-here"
+# TROJAN_PASS = "your-trojan-password"
+# PROXYIP = ""
