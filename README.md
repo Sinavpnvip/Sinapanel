@@ -115,3 +115,20 @@ MIT
 - Brain is admin-managed: the build does not bundle a harvested public-proxy list.
 - Brain results are ranked by availability and latency.
 - The existing protocol implementation is preserved rather than replaced blindly.
+
+# V4 Reliability / Performance Layer
+
+This release hardens the existing panel without replacing its protocol implementation.
+
+## Added
+- Defensive binary parsing helpers.
+- Host/IP/port validation for Brain endpoints.
+- Timeout-controlled endpoint health checks.
+- `/api/brain` health endpoint.
+- `/api/health` diagnostic endpoint.
+- Improved client-side API error reporting.
+- Compatibility with the existing KV-backed user/subscription format.
+
+## Important
+Keep the existing Cloudflare KV binding named `APP_KV` and existing secrets/environment variables.
+Do not commit credentials or private proxy lists to GitHub.
