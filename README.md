@@ -96,3 +96,12 @@ wrangler deploy
 ## لایسنس
 
 MIT
+
+
+## v2 Reliability Fixes
+- Added defensive KV/JSON handling.
+- Added input normalization and validation helpers.
+- API errors can now be returned as structured JSON.
+- Frontend error handling can display the server error instead of a generic `Error`.
+- Existing protocol implementation and legacy KV array format are preserved.
+- `APP_KV` must be configured in Cloudflare Workers.

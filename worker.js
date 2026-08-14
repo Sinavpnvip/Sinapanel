@@ -1,3 +1,125 @@
+/* SFDNS_PANEL_V2_PATCH */
+
+/*
+ * SFDNS Panel v2 compatibility / reliability patch
+ *
+ * Goals:
+ * - Never let malformed KV JSON crash user/sub endpoints.
+ * - Validate and normalize users/subscriptions.
+ * - Return useful API errors instead of generic "Error".
+ * - Preserve the existing protocol implementation.
+ * - Keep backward compatibility with the original KV array format.
+ */
+
+const SFDNS_V2 = {
+  version: 2,
+
+  jsonResponse(data, status = 200) {
+    return new Response(JSON.stringify(data), {
+      status,
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-store"
+      }
+    });
+  },
+
+  asArray(value, name) {
+    if (Array.isArray(value)) return value;
+    if (value == null) return [];
+    throw new Error(`${name} storage is not an array`);
+  },
+
+  async readArray(kv, key, name) {
+    if (!kv || typeof kv.get !== "function") {
+      throw new Error("APP_KV binding is missing");
+    }
+
+    const raw = await kv.get(key);
+    if (!raw) return [];
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`${name} storage contains invalid JSON`);
+    }
+
+    return SFDNS_V2.asArray(parsed, name);
+  },
+
+  async writeArray(kv, key, value, name) {
+    if (!Array.isArray(value)) throw new Error(`${name} must be an array`);
+    await kv.put(key, JSON.stringify(value));
+  },
+
+  id(prefix = "id") {
+    return `${prefix}_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
+  },
+
+  cleanString(value, max = 256) {
+    if (typeof value !== "string") return "";
+    return value.trim().slice(0, max);
+  },
+
+  positiveInt(value, fallback = 0, max = 2147483647) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(0, Math.floor(n)));
+  },
+
+  normalizeUser(input) {
+    const u = (input && typeof input === "object") ? input : {};
+    return {
+      ...u,
+      id: this.cleanString(u.id, 128) || this.id("usr"),
+      name: this.cleanString(u.name, 100),
+      subId: this.cleanString(u.subId, 128),
+      traffic: this.positiveInt(u.traffic, 0),
+      days: this.positiveInt(u.days, 0, 36500),
+      maxDevices: this.positiveInt(u.maxDevices, 1, 1000),
+      enabled: u.enabled !== false
+    };
+  },
+
+  normalizeSub(input) {
+    const s = (input && typeof input === "object") ? input : {};
+    return {
+      ...s,
+      id: this.cleanString(s.id, 128) || this.id("sub"),
+      name: this.cleanString(s.name, 100),
+      maxUsers: this.positiveInt(s.maxUsers, 0, 1000000),
+      traffic: this.positiveInt(s.traffic, 0),
+      days: this.positiveInt(s.days, 0, 36500),
+      enabled: s.enabled !== false
+    };
+  },
+
+  validateUser(u) {
+    const errors = [];
+    if (!u.name) errors.push("name is required");
+    if (!u.subId) errors.push("subId is required");
+    if (u.maxDevices < 1) errors.push("maxDevices must be at least 1");
+    return errors;
+  },
+
+  validateSub(s) {
+    const errors = [];
+    if (!s.name) errors.push("name is required");
+    if (s.maxUsers < 0) errors.push("maxUsers is invalid");
+    return errors;
+  },
+
+  error(message, status = 400, details = null) {
+    return this.jsonResponse({
+      ok: false,
+      error: message,
+      ...(details ? { details } : {})
+    }, status);
+  }
+};
+
+
 /**
  * ═══════════════════════════════════════════════════════════════
  *   APP Panel  ·  Advanced Proxy Panel  v1.1
@@ -1127,7 +1249,14 @@ async function saveSub(){
   };
   const r = await fetch('/api/subs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   if(r.ok){closeModal('modalSub');toast(isFa?'ذخیره شد':'Saved');loadAll()}
-  else toast('Error');
+  else {
+  let msg = 'Request failed';
+  try {
+    const e = await r.json();
+    msg = e.error || e.message || msg;
+  } catch {}
+  toast(msg);
+};
 }
 async function delSub(id){
   if(!confirm(isFa?'حذف شود؟':'Delete?'))return;
@@ -1192,7 +1321,14 @@ async function saveUser(){
   };
   const r=await fetch('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   if(r.ok){closeModal('modalUser');toast(isFa?'ذخیره شد':'Saved');loadAll()}
-  else toast('Error');
+  else {
+  let msg = 'Request failed';
+  try {
+    const e = await r.json();
+    msg = e.error || e.message || msg;
+  } catch {}
+  toast(msg);
+};
 }
 async function delUser(id){
   if(!confirm(isFa?'حذف شود؟':'Delete?'))return;
