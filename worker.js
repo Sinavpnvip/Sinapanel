@@ -1178,7 +1178,7 @@ export default {
         return await handleAPI(request, env, path);
       }
 
-      if (path.startsWith(SUB_PATH + '/')) {
+            if (path.startsWith(SUB_PATH + '/')) {
         const id = path.slice(SUB_PATH.length + 1).split('/')[0];
         const settings = await getSettings(env);
         const users = await getUsers(env);
@@ -1191,6 +1191,17 @@ export default {
           const totalBytes = user.traffic > 0 ? user.traffic * 1024 * 1024 * 1024 : 0;
           const expireTime = user.expire ? Math.floor(new Date(user.expire).getTime() / 1000) : 0;
           
+          const userAgent = request.headers.get('User-Agent') || '';
+          const isBrowser = !userAgent.toLowerCase().includes('v2ray') && !userAgent.toLowerCase().includes('hiddify') && !userAgent.toLowerCase().includes('sing-box') && !userAgent.toLowerCase().includes('clash') && !userAgent.toLowerCase().includes('mozilla');
+          
+          if (isBrowser) {
+            const usedGB = (usedBytes / 1024 / 1024 / 1024).toFixed(2);
+            const totalGB = user.traffic > 0 ? user.traffic : '∞';
+            const remainDays = user.expire ? Math.max(0, Math.ceil((new Date(user.expire) - new Date()) / 86400000)) : '∞';
+            
+            return new Response(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Subscription Info</title><style>body{font-family:Inter,sans-serif;background:#f8fafc;color:#1e293b;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.box{background:#fff;padding:2rem;border-radius:16px;box-shadow:0 4px 6px rgba(0,0,0,.1);text-align:center;max-width:400px;width:90%}h1{color:#4f46e5;margin-bottom:1rem}.info{background:#f1f5f9;padding:1rem;border-radius:8px;margin:.5rem 0;text-align:left}.info strong{color:#64748b;display:block;font-size:.8rem}.info span{font-size:1.2rem;font-weight:700;color:#1e293b}.btn{display:inline-block;margin-top:1.5rem;padding:.8rem 1.5rem;background:#4f46e5;color:#fff;text-decoration:none;border-radius:8px;font-weight:600}</style></head><body><div class="box"><h1>APP Panel</h1><div class="info"><strong>Username</strong><span>${user.name}</span></div><div class="info"><strong>Traffic Usage</strong><span>${usedGB} / ${totalGB} GB</span></div><div class="info"><strong>Expiry Date</strong><span>${user.expire || 'Unlimited'}</span></div><div class="info"><strong>Remaining Days</strong><span>${remainDays}</span></div><a href="v2rayng://install-sub?url=${url.origin}/sub/${user.id}" class="btn">Import to v2rayNG</a></div></body></html>`, { headers: { 'Content-Type': 'text/html;charset=utf-8' }});
+          }
+
           return new Response(generateUserSubContent(user, sub, settings, host), {
             headers: {
               'Content-Type': 'text/plain;charset=utf-8',
