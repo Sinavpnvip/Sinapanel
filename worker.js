@@ -1128,7 +1128,7 @@ label.lbl{display:block;margin-bottom:.1rem;font-size:.7rem;color:var(--muted)}
 const isFa = ${isFa ? 'true' : 'false'};
 let settings = {}, subs = [], users = [];
 let brainMode = 'proxy';
-const const BRAIN_IPS = [];
+const BRAIN_IPS = [];
 
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200)}
 function openModal(id){document.getElementById(id).classList.add('show')}
