@@ -1,7 +1,7 @@
 /**
  * ═══════════════════════════════════════════════════════════════
- *   APP Panel  ·  Advanced Proxy Panel  v2.0 (Enterprise Edition)
- *   پنل پروکسی پیشرفته — پشتیبانی از D1، UUID اختصاصی و Clean IP خودکار
+ *   APP Panel  ·  Advanced Proxy Panel  v2.1 (Final Enterprise)
+ *   پنل پروکسی پیشرفته — پشتیبانی کامل از D1، UUID اختصاصی و UI ساب
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -50,6 +50,20 @@ function html(content) {
 
 function redirect(url) {
   return Response.redirect(url, 302);
+}
+
+// ──────────────────────────── Default Settings ────────────────────────────
+function defaultSettings() {
+  return {
+    password: DEFAULT_PASSWORD,
+    uuid: uuid(),
+    trojanPassword: 'trojan' + Math.random().toString(36).slice(2, 10),
+    fingerprint: 'chrome',
+    fragment: { length: '10-20', interval: '10-20', packets: 'tlshello' },
+    warp: { enabled: false, pro: false, endpoint: '' },
+    proxyIP: '',
+    cleanIPs: []
+  };
 }
 
 // ──────────────────────────── D1 Database Helpers ────────────────────────────
@@ -147,13 +161,6 @@ async function deleteUser(env, id) {
   await env.APP_DB.prepare("DELETE FROM users WHERE id = ?").bind(id).run();
 }
 
-async function getUserByUUID(env, uuidStr) {
-  if (!env.APP_DB) return null;
-  const user = await env.APP_DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(uuidStr).first();
-  if (!user) return null;
-  return user;
-}
-
 async function updateUserTraffic(env, userId, bytesToAdd) {
   if (!env.APP_DB || !userId || bytesToAdd <= 0) return;
   await env.APP_DB.prepare("UPDATE users SET used = used + ? WHERE id = ?").bind(bytesToAdd, userId).run();
@@ -182,20 +189,6 @@ async function createSession(env) {
     await env.APP_DB.prepare("INSERT INTO sessions (token, expire) VALUES (?, ?)").bind(token, expire).run();
   }
   return token;
-}
-
-// ──────────────────────────── Default Settings ────────────────────────────
-function defaultSettings() {
-  return {
-    password: DEFAULT_PASSWORD,
-    uuid: uuid(),
-    trojanPassword: 'trojan' + Math.random().toString(36).slice(2, 10),
-    fingerprint: 'chrome',
-    fragment: { length: '10-20', interval: '10-20', packets: 'tlshello' },
-    warp: { enabled: false, pro: false, endpoint: '' },
-    proxyIP: '',
-    cleanIPs: []
-  };
 }
 
 // ──────────────────────────── Subscription Generator ────────────────────────────
@@ -346,7 +339,6 @@ function makeReadableWebSocketStream(webSocket, earlyData) {
   });
 }
 
-// Unified & Single Declaration of WebSocket Handler
 async function handleVLESSWebSocket(request, env, settings, currentUser, ctx) {
   const webSocketPair = new WebSocketPair();
   const [client, webSocket] = Object.values(webSocketPair);
@@ -389,7 +381,6 @@ async function handleVLESSWebSocket(request, env, settings, currentUser, ctx) {
         return;
       }
       
-      // Use user's specific UUID if available, else fallback to global settings UUID
       const expectedUUID = currentUser ? currentUser.uuid : settings.uuid;
       const parsed = processVlessHeader(chunk, expectedUUID);
       if (parsed.hasError) {
@@ -565,8 +556,6 @@ label.lbl{display:block;margin-bottom:.25rem;font-size:.75rem;color:var(--muted)
 .client-item strong{display:block;color:var(--primary);margin-bottom:.25rem;font-size:.85rem}
 .client-item a{color:var(--blue);font-size:.7rem;text-decoration:none}
 .hidden{display:none!important}
-.loading-spinner{border:2px solid rgba(255,255,255,.3);border-radius:50%;border-top:2px solid #fff;width:16px;height:16px;animation:spin 1s linear infinite;display:none}
-@keyframes spin{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
@@ -1046,18 +1035,8 @@ async function handleAPI(request, env, path) {
     });
   }
 
-  // Endpoint for Auto Clean IP (Brain)
   if (path === '/api/brain') {
     try {
-      // Attempt to fetch from a public clean IP service
-      const res = await fetch('https://cleanip.example.com/api?format=json'); // Note: User should replace with a real clean IP API
-      if (!res.ok) throw new Error('Failed to fetch');
-      const data = await res.json();
-      const ips = (data.ips || []).slice(0, 10).map(ip => ({ ip, ms: Math.floor(Math.random() * 50) + 20 }));
-      if (ips.length === 0) throw new Error('No IPs');
-      return json({ ips });
-    } catch (e) {
-      // Fallback to Cloudflare default IPs if API fails
       const fallback = [
         {ip:'104.16.128.50', ms:42},
         {ip:'104.17.176.20', ms:55},
@@ -1066,6 +1045,8 @@ async function handleAPI(request, env, path) {
         {ip:'cdnjs.cloudflare.com', ms:31}
       ];
       return json({ ips: fallback });
+    } catch (e) {
+      return json({ error: 'failed' });
     }
   }
 
@@ -1115,7 +1096,7 @@ async function handleAPI(request, env, path) {
       const body = await request.json().catch(() => ({}));
       if (!body.id) {
         body.id = uuid().slice(0, 8);
-        body.uuid = body.uuid || uuid(); // Generate UUID for new user if not provided
+        body.uuid = body.uuid || uuid();
         body.used = 0;
         body.enabled = true;
         if (body.days) {
@@ -1164,21 +1145,14 @@ export default {
       const upgrade = request.headers.get('Upgrade') || '';
       if (upgrade.toLowerCase() === 'websocket') {
         const settings = await getSettings(env);
-        
-        // To avoid parsing headers twice, we do a quick regex to extract UUID from the path if it exists
-        // However, VLESS protocol embeds the UUID in the early data (chunk), not the HTTP path.
-        // So we rely on processVlessHeader to validate it.
-        // But we still need to identify the user BEFORE accepting the connection to block expired ones.
-        // Since we can't read the VLESS header before accepting, we allow the WS upgrade and block inside the stream.
-        
-        return handleVLESSWebSocket(request, env, settings, null, ctx); // currentUser is identified inside the stream
+        return handleVLESSWebSocket(request, env, settings, null, ctx);
       }
 
       if (path.startsWith(API_PATH)) {
         return await handleAPI(request, env, path);
       }
 
-            if (path.startsWith(SUB_PATH + '/')) {
+      if (path.startsWith(SUB_PATH + '/')) {
         const id = path.slice(SUB_PATH.length + 1).split('/')[0];
         const settings = await getSettings(env);
         const users = await getUsers(env);
@@ -1191,8 +1165,14 @@ export default {
           const totalBytes = user.traffic > 0 ? user.traffic * 1024 * 1024 * 1024 : 0;
           const expireTime = user.expire ? Math.floor(new Date(user.expire).getTime() / 1000) : 0;
           
+          const subHeaders = {
+            'Content-Type': 'text/plain;charset=utf-8',
+            'Profile-Update-Interval': '6',
+            'Subscription-Userinfo': `upload=0; download=${usedBytes}; total=${totalBytes}; expire=${expireTime}`
+          };
+          
           const userAgent = request.headers.get('User-Agent') || '';
-          const isBrowser = !userAgent.toLowerCase().includes('v2ray') && !userAgent.toLowerCase().includes('hiddify') && !userAgent.toLowerCase().includes('sing-box') && !userAgent.toLowerCase().includes('clash') && !userAgent.toLowerCase().includes('mozilla');
+          const isBrowser = !userAgent.toLowerCase().includes('v2ray') && !userAgent.toLowerCase().includes('hiddify') && !userAgent.toLowerCase().includes('sing-box') && !userAgent.toLowerCase().includes('clash') && !userAgent.toLowerCase().includes('tun');
           
           if (isBrowser) {
             const usedGB = (usedBytes / 1024 / 1024 / 1024).toFixed(2);
@@ -1203,11 +1183,7 @@ export default {
           }
 
           return new Response(generateUserSubContent(user, sub, settings, host), {
-            headers: {
-              'Content-Type': 'text/plain;charset=utf-8',
-              'Profile-Update-Interval': '6',
-              'Subscription-Userinfo': `upload=0; download=${usedBytes}; total=${totalBytes}; expire=${expireTime}`
-            }
+            headers: subHeaders
           });
         }
         
