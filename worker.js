@@ -1,7 +1,7 @@
 /**
  * ═══════════════════════════════════════════════════════════════
- *   APP Panel  ·  Advanced Proxy Panel  v2.2 (Neon Dark Edition)
- *   پنل پروکسی پیشرفته — رفع باگ اتصال + تم تاریک نئونی
+ *   APP Panel  ·  Enterprise Proxy Panel  v3.0 (Ultimate Edition)
+ *   Engineered for High Performance, D1 Database, and Zero-Bug Routing
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -13,7 +13,7 @@ const SUB_PATH = '/sub';
 const DOH_PATH = '/doh';
 const API_PATH = '/api';
 
-// ──────────────────────────── Utils ────────────────────────────
+// ──────────────────────────── Core Utils ────────────────────────────
 function uuid() {
   return crypto.randomUUID();
 }
@@ -38,13 +38,21 @@ function base64ToArrayBuffer(base64Str) {
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store' }
+    headers: { 
+      'Content-Type': 'application/json;charset=utf-8', 
+      'Cache-Control': 'no-store',
+      'Access-Control-Allow-Origin': '*'
+    }
   });
 }
 
 function html(content) {
   return new Response(content, {
-    headers: { 'Content-Type': 'text/html;charset=utf-8', 'Cache-Control': 'no-store' }
+    headers: { 
+      'Content-Type': 'text/html;charset=utf-8', 
+      'Cache-Control': 'no-store',
+      'Referrer-Policy': 'no-referrer'
+    }
   });
 }
 
@@ -52,21 +60,7 @@ function redirect(url) {
   return Response.redirect(url, 302);
 }
 
-// ──────────────────────────── Default Settings ────────────────────────────
-function defaultSettings() {
-  return {
-    password: DEFAULT_PASSWORD,
-    uuid: uuid(),
-    trojanPassword: 'trojan' + Math.random().toString(36).slice(2, 10),
-    fingerprint: 'chrome',
-    fragment: { length: '10-20', interval: '10-20', packets: 'tlshello' },
-    warp: { enabled: false, pro: false, endpoint: '' },
-    proxyIP: '',
-    cleanIPs: []
-  };
-}
-
-// ──────────────────────────── D1 Database Helpers ────────────────────────────
+// ──────────────────────────── D1 Database Layer ────────────────────────────
 async function getSettings(env) {
   if (!env.APP_DB) return defaultSettings();
   try {
@@ -84,9 +78,11 @@ async function getSettings(env) {
 async function saveSettings(env, data) {
   if (!env.APP_DB) return;
   const stmt = env.APP_DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)");
+  const promises = [];
   for (const [key, value] of Object.entries(data)) {
-    await stmt.bind(key, JSON.stringify(value)).run();
+    promises.push(stmt.bind(key, JSON.stringify(value)).run());
   }
+  await Promise.all(promises);
 }
 
 async function getSubs(env) {
@@ -155,7 +151,7 @@ async function resetUserTraffic(env, userId) {
   await env.APP_DB.prepare("UPDATE users SET used = 0 WHERE id = ?").bind(userId).run();
 }
 
-// ──────────────────────────── Auth ────────────────────────────
+// ──────────────────────────── Auth & Sessions ────────────────────────────
 async function checkAuth(request, env) {
   const cookie = request.headers.get('Cookie') || '';
   const match = cookie.match(/app_token=([^;]+)/);
@@ -238,7 +234,7 @@ function generateSubContent(sub, settings, host) {
   return btoa(links.join('\n'));
 }
 
-// ──────────────────────────── VLESS Handler (Core) ────────────────────────────
+// ──────────────────────────── VLESS Protocol Engine ────────────────────────────
 function processVlessHeader(buffer, expectedUUID) {
   if (buffer.byteLength < 24) return { hasError: true, message: 'invalid header' };
   const view = new DataView(buffer);
@@ -247,9 +243,7 @@ function processVlessHeader(buffer, expectedUUID) {
   const uuidStr = [...uuidBytes].map(b => b.toString(16).padStart(2, '0')).join('')
     .replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5');
   
-  if (uuidStr.toLowerCase() !== expectedUUID.toLowerCase()) {
-    return { hasError: true, message: 'invalid uuid', uuidStr };
-  }
+  const isGlobalMatch = uuidStr.toLowerCase() === expectedUUID.toLowerCase();
   
   const optLen = new Uint8Array(buffer.slice(17, 18))[0];
   const cmd = new Uint8Array(buffer.slice(18 + optLen, 19 + optLen))[0];
@@ -287,7 +281,7 @@ function processVlessHeader(buffer, expectedUUID) {
   }
   
   const rawDataIndex = addressIndex + addressLength;
-  return { hasError: false, addressRemote, portRemote, rawDataIndex, vlessVersion: new Uint8Array([version]), isUDP, uuidStr };
+  return { hasError: false, addressRemote, portRemote, rawDataIndex, vlessVersion: new Uint8Array([version]), isUDP, uuidStr, isGlobalMatch };
 }
 
 function makeReadableWebSocketStream(webSocket, earlyData) {
@@ -303,7 +297,12 @@ function makeReadableWebSocketStream(webSocket, earlyData) {
   });
 }
 
-async function handleVLESSWebSocket(request, env, settings, currentUser, ctx) {
+/**
+ * High-Performance WebSocket Handler
+ * Accepts connection instantly to prevent client timeout/ping failure.
+ * Resolves user UUID asynchronously from D1.
+ */
+async function handleVLESSWebSocket(request, env, settings, ctx) {
   const webSocketPair = new WebSocketPair();
   const [client, webSocket] = Object.values(webSocketPair);
   webSocket.accept();
@@ -315,7 +314,9 @@ async function handleVLESSWebSocket(request, env, settings, currentUser, ctx) {
 
   let isUserBlocked = false;
   let accumulatedBytes = 0;
-  let userLoaded = false; 
+  let currentUser = null;
+  let userResolved = false;
+  let dbSavePromise = Promise.resolve();
 
   readable.pipeTo(new WritableStream({
     async write(chunk) {
@@ -324,7 +325,7 @@ async function handleVLESSWebSocket(request, env, settings, currentUser, ctx) {
         await writer.write(chunk);
         writer.releaseLock();
         
-        if (userLoaded && currentUser && !isUserBlocked) {
+        if (userResolved && currentUser && !isUserBlocked) {
           const chunkBytes = chunk.byteLength || chunk.length || 0;
           accumulatedBytes += chunkBytes;
           
@@ -337,21 +338,26 @@ async function handleVLESSWebSocket(request, env, settings, currentUser, ctx) {
             webSocket.close(1000, 'account expired');
           }
           
-          if (accumulatedBytes > 1048576) {
-            ctx.waitUntil(updateUserTraffic(env, currentUser.id, accumulatedBytes));
-            currentUser.used += accumulatedBytes;
+          // Buffer DB writes to every 5MB to avoid D1 rate limits
+          if (accumulatedBytes > 5242880) {
+            const bytesToSave = accumulatedBytes;
             accumulatedBytes = 0;
+            dbSavePromise = dbSavePromise.then(() => updateUserTraffic(env, currentUser.id, bytesToSave));
+            currentUser.used += bytesToSave;
           }
         }
         return;
       }
       
-      const expectedUUID = currentUser ? currentUser.uuid : settings.uuid;
-      const parsed = processVlessHeader(chunk, expectedUUID);
+      const parsed = processVlessHeader(chunk, settings.uuid);
       
-      if (!currentUser && env.APP_DB && parsed.uuidStr) {
+      if (!parsed.isGlobalMatch && env.APP_DB && parsed.uuidStr) {
         currentUser = await getUserByUUID(env, parsed.uuidStr);
-        userLoaded = true;
+        userResolved = true;
+        if (!currentUser) {
+          webSocket.close(1000, 'invalid uuid');
+          return;
+        }
       }
 
       if (parsed.hasError) {
@@ -382,12 +388,13 @@ async function handleVLESSWebSocket(request, env, settings, currentUser, ctx) {
           write(data) { 
             if (!isUserBlocked) {
               webSocket.send(data); 
-              if (userLoaded && currentUser) {
+              if (userResolved && currentUser) {
                 accumulatedBytes += data.byteLength || data.length || 0;
-                if (accumulatedBytes > 1048576) {
-                  ctx.waitUntil(updateUserTraffic(env, currentUser.id, accumulatedBytes));
-                  currentUser.used += accumulatedBytes;
+                if (accumulatedBytes > 5242880) {
+                  const bytesToSave = accumulatedBytes;
                   accumulatedBytes = 0;
+                  dbSavePromise = dbSavePromise.then(() => updateUserTraffic(env, currentUser.id, bytesToSave));
+                  currentUser.used += bytesToSave;
                 }
               }
             }
@@ -402,38 +409,38 @@ async function handleVLESSWebSocket(request, env, settings, currentUser, ctx) {
   })).catch(() => {});
 
   webSocket.addEventListener('close', async () => {
-    if (userLoaded && currentUser && env.APP_DB && accumulatedBytes > 0) {
+    if (userResolved && currentUser && env.APP_DB && accumulatedBytes > 0) {
       await updateUserTraffic(env, currentUser.id, accumulatedBytes);
     }
+    await dbSavePromise; // Ensure final DB write completes
   });
 
   return new Response(null, { status: 101, webSocket: client });
 }
 
-// ──────────────────────────── CSS Theme Generator ────────────────────────────
-function getStyles(isDark) {
+// ──────────────────────────── UI Theme Engine ────────────────────────────
+function getThemeStyles(isDark) {
   if (isDark) {
-    return `:root{--bg:#030303;--card:#0a0f0a;--text:#e8ffe8;--muted:#6b8f6b;--light:#0f1a0f;--primary:#00ff88;--primary-hover:#33ffaa;--primary-soft:rgba(0,255,136,.1);--border:rgba(0,255,136,.15);--border2:rgba(0,255,136,.3);--danger:#ff4d6a;--danger-soft:rgba(255,77,106,.1);--success:#00ff88;--success-soft:rgba(0,255,136,.1);--yellow:#ffd166;--yellow-soft:rgba(255,209,102,.1);--blue:#4cc9f0;--blue-soft:rgba(76,201,240,.1);--glow:rgba(0,255,136,.35)}
-    body{background-image:linear-gradient(rgba(0,255,136,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(0,255,136,.02) 1px,transparent 1px);background-size:40px 40px}
-    .card{box-shadow:0 0 15px rgba(0,0,0,.5) inset}
-    .modal{box-shadow:0 0 30px var(--glow)}
-    button,.btn{box-shadow:0 0 10px var(--glow)}
-    .nav a.active{box-shadow:0 0 15px var(--glow)}`;
+    return {
+      bg: '#050505', card: '#0a0a0a', text: '#e8ffe8', muted: '#6b8f6b', light: '#111111',
+      primary: '#00ff88', border: 'rgba(0,255,136,.15)', glow: 'rgba(0,255,136,.3)',
+      bgImage: 'linear-gradient(rgba(0,255,136,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(0,255,136,.02) 1px,transparent 1px)'
+    };
   } else {
-    return `:root{--bg:#f8fafc;--card:#ffffff;--text:#1e293b;--muted:#64748b;--light:#f1f5f9;--primary:#4f46e5;--primary-hover:#4338ca;--primary-soft:#eef2ff;--border:#e2e8f0;--border2:#c7d2fe;--danger:#ef4444;--danger-soft:#fef2f2;--success:#10b981;--success-soft:#ecfdf5;--yellow:#f59e0b;--yellow-soft:#fffbeb;--blue:#3b82f6;--blue-soft:#eff6ff;--glow:rgba(79,70,229,.2)}
-    body{background-image:none}
-    .card{box-shadow:0 1px 3px rgba(0,0,0,.03)}
-    .modal{box-shadow:0 20px 25px -5px rgba(0,0,0,.1)}
-    button,.btn{box-shadow:none}
-    .nav a.active{box-shadow:0 4px 6px -1px rgba(79,70,229,.2)}`;
+    return {
+      bg: '#f8fafc', card: '#ffffff', text: '#1e293b', muted: '#64748b', light: '#f1f5f9',
+      primary: '#4f46e5', border: '#e2e8f0', glow: 'rgba(79,70,229,.15)',
+      bgImage: 'none'
+    };
   }
 }
 
-// ──────────────────────────── Panel HTML ────────────────────────────
+// ──────────────────────────── Panel HTML Generator ────────────────────────────
 function getPanelHTML(lang, theme, authenticated) {
   const isFa = lang !== 'en';
   const isDark = theme !== 'light';
-  
+  const c = getThemeStyles(isDark);
+
   if (!authenticated) {
     return `<!DOCTYPE html>
 <html lang="${isFa ? 'fa' : 'en'}" dir="${isFa ? 'rtl' : 'ltr'}">
@@ -442,25 +449,25 @@ function getPanelHTML(lang, theme, authenticated) {
 <title>APP Panel Login</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700&family=Inter:wght@400;600;700&display=swap');
-:root{--bg:#030303;--card:#0a0f0a;--text:#e8ffe8;--muted:#6b8f6b;--light:#0f1a0f;--primary:#00ff88;--primary-hover:#33ffaa;--primary-soft:rgba(0,255,136,.1);--border:rgba(0,255,136,.15);--border2:rgba(0,255,136,.3);--danger:#ff4d6a;--danger-soft:rgba(255,77,106,.1);--success:#00ff88;--success-soft:rgba(0,255,136,.1);--yellow:#ffd166;--yellow-soft:rgba(255,209,102,.1);--blue:#4cc9f0;--blue-soft:rgba(76,201,240,.1);--glow:rgba(0,255,136,.35)}
-*{box-sizing:border-box;margin:0;padding:0;font-family:${isFa?'Vazirmatn':'Inter'},system-ui,sans-serif;transition:background-color .3s,color .3s}
-body{background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;background-image:linear-gradient(rgba(0,255,136,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(0,255,136,.02) 1px,transparent 1px);background-size:40px 40px}
+:root{--bg:${c.bg};--card:${c.card};--text:${c.text};--muted:${c.muted};--primary:${c.primary};--border:${c.border};--glow:${c.glow}}
+*{box-sizing:border-box;margin:0;padding:0;font-family:${isFa?'Vazirmatn':'Inter'},system-ui,sans-serif;transition:all .3s}
+body{background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;background-image:${c.bgImage};background-size:40px 40px}
 .box{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:2.5rem;width:100%;max-width:380px;text-align:center;box-shadow:0 0 30px var(--glow)}
 h1{color:var(--primary);font-size:1.5rem;margin-bottom:.5rem;font-weight:700;text-shadow:0 0 10px var(--glow)}
 p{color:var(--muted);font-size:.9rem;margin-bottom:1.5rem}
-input{width:100%;padding:.8rem 1rem;background:var(--bg);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:.95rem;margin-bottom:1rem;transition:.2s}
-input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-soft)}
-button{width:100%;padding:.8rem;background:var(--primary);color:#000;border:none;border-radius:10px;font-weight:600;font-size:.95rem;cursor:pointer;transition:.2s;box-shadow:0 0 15px var(--glow)}
-button:hover{background:var(--primary-hover)}
-.err{color:var(--danger);font-size:.8rem;margin-top:.75rem;display:none}
-.top-bar{position:fixed;top:1rem;left:1rem;display:flex;gap:.5rem}
+input{width:100%;padding:.8rem 1rem;background:var(--bg);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:.95rem;margin-bottom:1rem}
+input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px ${isDark?'rgba(0,255,136,.1)':'rgba(79,70,229,.1)'}}
+button{width:100%;padding:.8rem;background:var(--primary);color:${isDark?'#000':'#fff'};border:none;border-radius:10px;font-weight:600;font-size:.95rem;cursor:pointer;transition:.2s;box-shadow:0 0 15px var(--glow)}
+button:hover{opacity:.9}
+.err{color:#ff4d6a;font-size:.8rem;margin-top:.75rem;display:none}
+.top-bar{position:fixed;top:1rem;left:1rem;display:flex;gap:.5rem;z-index:99}
 .tb-btn{background:var(--card);border:1px solid var(--border);color:var(--muted);padding:.35rem .65rem;border-radius:8px;cursor:pointer;font-size:.75rem;text-decoration:none}
 </style>
 </head>
 <body>
 <div class="top-bar">
-  <a href="?lang=${isFa?'en':'fa'}&theme=${isDark?'light':'dark'}" class="tb-btn">${isFa?'EN':'FA'}</a>
-  <a href="?lang=${lang}&theme=${isDark?'light':'dark'}" class="tb-btn">${isDark?'☀️ Light':'🌙 Dark'}</a>
+  <a href="?lang=${isFa?'en':'fa'}&theme=${theme}" class="tb-btn">${isFa?'EN':'FA'}</a>
+  <a href="?lang=${lang}&theme=${isDark?'light':'dark'}" class="tb-btn">${isDark?'☀️':'🌙'}</a>
 </div>
 <div class="box">
   <h1>APP Panel</h1>
@@ -488,18 +495,18 @@ document.getElementById('f').onsubmit=async e=>{
 <title>APP Panel</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
-:root{--bg:#030303;--card:#0a0f0a;--text:#e8ffe8;--muted:#6b8f6b;--light:#0f1a0f;--primary:#00ff88;--primary-hover:#33ffaa;--primary-soft:rgba(0,255,136,.1);--border:rgba(0,255,136,.15);--border2:rgba(0,255,136,.3);--danger:#ff4d6a;--danger-soft:rgba(255,77,106,.1);--success:#00ff88;--success-soft:rgba(0,255,136,.1);--yellow:#ffd166;--yellow-soft:rgba(255,209,102,.1);--blue:#4cc9f0;--blue-soft:rgba(76,201,240,.1);--glow:rgba(0,255,136,.35)}
+:root{--bg:${c.bg};--card:${c.card};--text:${c.text};--muted:${c.muted};--light:${c.light};--primary:${c.primary};--border:${c.border};--glow:${c.glow};--danger:#ff4d6a;--success:${isDark?'#00ff88':'#10b981'};--blue:${isDark?'#4cc9f0':'#3b82f6'};--yellow:${isDark?'#ffd166':'#f59e0b'}}
 *{box-sizing:border-box;margin:0;padding:0;font-family:${isFa?'Vazirmatn':'Inter'},system-ui,sans-serif;transition:background-color .3s,color .3s,border-color .3s}
-body{background:var(--bg);color:var(--text);min-height:100vh;line-height:1.5;background-image:linear-gradient(rgba(0,255,136,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(0,255,136,.02) 1px,transparent 1px);background-size:40px 40px}
+body{background:var(--bg);color:var(--text);min-height:100vh;line-height:1.5;background-image:${c.bgImage};background-size:40px 40px}
 .container{max-width:1100px;margin:0 auto;padding:1.5rem 1rem 4rem}
 .header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;margin-bottom:2rem;padding-bottom:1.5rem;border-bottom:1px solid var(--border)}
 .logo{font-weight:700;font-size:1.25rem;color:var(--primary);display:flex;align-items:center;gap:.5rem;text-shadow:0 0 10px var(--glow)}
 .logo::before{content:'';width:10px;height:10px;background:var(--primary);border-radius:50%;box-shadow:0 0 10px var(--primary)}
 .nav{display:flex;flex-wrap:wrap;gap:.25rem;margin-bottom:1.5rem;background:var(--card);padding:.35rem;border-radius:12px;border:1px solid var(--border)}
 .nav a{padding:.5rem 1rem;border-radius:8px;color:var(--muted);font-size:.85rem;font-weight:500;cursor:pointer;text-decoration:none;transition:.2s}
-.nav a.active{color:#000;background:var(--primary);box-shadow:0 0 15px var(--glow)}
+.nav a.active{color:${isDark?'#000':'#fff'};background:var(--primary);box-shadow:0 0 15px var(--glow)}
 .nav a:not(.active):hover{background:var(--light);color:var(--text)}
-.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.5rem;margin-bottom:1rem;box-shadow:0 0 15px rgba(0,0,0,.5) inset}
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.5rem;margin-bottom:1rem;box-shadow:${isDark?'0 0 15px rgba(0,0,0,.5) inset':'0 1px 3px rgba(0,0,0,.03)'}}
 h2{font-size:1.1rem;font-weight:600;margin-bottom:1rem;color:var(--primary);text-shadow:0 0 8px var(--glow)}
 .muted{color:var(--muted);font-size:.8rem}
 .stats{display:grid;grid-template-columns:repeat(2,1fr);gap:.75rem;margin-bottom:.5rem}
@@ -511,32 +518,30 @@ h2{font-size:1.1rem;font-weight:600;margin-bottom:1rem;color:var(--primary);text
 .progress-bar{height:8px;background:var(--light);border-radius:99px;overflow:hidden}
 .progress-fill{height:100%;background:var(--primary);border-radius:99px;transition:width .3s ease;box-shadow:0 0 10px var(--glow)}
 .config-box{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:.75rem;font-family:ui-monospace,monospace;font-size:.75rem;word-break:break-all;position:relative;margin:.5rem 0;color:var(--text)}
-button,.btn{display:inline-flex;align-items:center;gap:.25rem;padding:.5rem 1rem;background:var(--primary);color:#000;border:none;border-radius:8px;font-size:.8rem;font-weight:500;cursor:pointer;transition:.2s;font-family:inherit;box-shadow:0 0 10px var(--glow)}
-button:hover{background:var(--primary-hover)}
+button,.btn{display:inline-flex;align-items:center;gap:.25rem;padding:.5rem 1rem;background:var(--primary);color:${isDark?'#000':'#fff'};border:none;border-radius:8px;font-size:.8rem;font-weight:500;cursor:pointer;transition:.2s;font-family:inherit;box-shadow:${isDark?'0 0 10px var(--glow)':'none'}}
+button:hover{opacity:0.9}
 .btn-sm{padding:.35rem .65rem;font-size:.75rem}
-.btn-outline{background:transparent;border:1px solid var(--border2);color:var(--primary);box-shadow:none}
-.btn-outline:hover{background:var(--primary-soft)}
+.btn-outline{background:transparent;border:1px solid var(--primary);color:var(--primary);box-shadow:none}
+.btn-outline:hover{background:${isDark?'rgba(0,255,136,.1)':'rgba(79,70,229,.1)'}}
 .btn-ghost{background:transparent;color:var(--muted);padding:.35rem .65rem;font-size:.75rem;box-shadow:none}
 .btn-ghost:hover{background:var(--light)}
 .btn-danger{background:transparent;border:1px solid var(--danger);color:var(--danger);box-shadow:none}
-.btn-danger:hover{background:var(--danger-soft)}
 .btn-blue{background:transparent;border:1px solid var(--blue);color:var(--blue);box-shadow:none}
-.btn-blue:hover{background:var(--blue-soft)}
 .badge{display:inline-block;padding:.2rem .5rem;border-radius:6px;font-size:.65rem;font-weight:600;margin:.05rem}
 .badge-default{color:var(--text);background:var(--light)}
-.badge-blue{color:var(--blue);background:var(--blue-soft)}
-.badge-yellow{color:var(--yellow);background:var(--yellow-soft)}
-.badge-red{color:var(--danger);background:var(--danger-soft)}
-.badge-green{color:var(--success);background:var(--success-soft)}
-input,textarea,select{width:100%;padding:.6rem .8rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.85rem;margin-bottom:.5rem;font-family:inherit;transition:.2s}
-input:focus,textarea:focus,select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-soft)}
+.badge-blue{color:var(--blue);background:${isDark?'rgba(76,201,240,.1)':'#eff6ff'}}
+.badge-yellow{color:var(--yellow);background:${isDark?'rgba(255,209,102,.1)':'#fffbeb'}}
+.badge-red{color:var(--danger);background:${isDark?'rgba(255,77,106,.1)':'#fef2f2'}}
+.badge-green{color:var(--success);background:${isDark?'rgba(0,255,136,.1)':'#ecfdf5'}}
+input,textarea,select{width:100%;padding:.6rem .8rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.85rem;margin-bottom:.5rem;font-family:inherit}
+input:focus,textarea:focus,select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px ${isDark?'rgba(0,255,136,.1)':'rgba(79,70,229,.1)'}}
 label.lbl{display:block;margin-bottom:.25rem;font-size:.75rem;color:var(--muted);font-weight:500}
 .grid{display:grid;gap:.75rem}@media(min-width:560px){.grid-2{grid-template-columns:1fr 1fr}}
-.toast{position:fixed;bottom:1.5rem;left:1.5rem;background:var(--primary);color:#000;padding:.75rem 1.25rem;border-radius:8px;font-weight:500;font-size:.85rem;opacity:0;transform:translateY(10px);transition:.3s;z-index:90;box-shadow:0 0 20px var(--glow)}
+.toast{position:fixed;bottom:1.5rem;left:1.5rem;background:var(--primary);color:${isDark?'#000':'#fff'};padding:.75rem 1.25rem;border-radius:8px;font-weight:500;font-size:.85rem;opacity:0;transform:translateY(10px);transition:.3s;z-index:90;box-shadow:0 0 20px var(--glow)}
 .toast.show{opacity:1;transform:translateY(0)}
 .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.8);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;z-index:80;padding:1rem}
 .modal-bg.show{display:flex}
-.modal{background:var(--card);border:1px solid var(--border2);border-radius:16px;padding:1.5rem;max-width:480px;width:100%;max-height:92vh;overflow-y:auto;box-shadow:0 0 30px var(--glow)}
+.modal{background:var(--card);border:1px solid var(--primary);border-radius:16px;padding:1.5rem;max-width:480px;width:100%;max-height:92vh;overflow-y:auto;box-shadow:0 0 30px var(--glow)}
 .modal h3{margin-bottom:1rem;font-size:1.1rem;font-weight:600;color:var(--primary)}
 .check-row{display:flex;align-items:center;gap:.5rem;margin-bottom:.5rem;font-size:.85rem;cursor:pointer}
 .check-row input{width:16px;height:16px;margin:0;accent-color:var(--primary)}
@@ -547,7 +552,7 @@ label.lbl{display:block;margin-bottom:.25rem;font-size:.75rem;color:var(--muted)
 .user-card-head{display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:.5rem;margin-bottom:.5rem}
 .user-meta{font-size:.75rem;color:var(--muted);margin-top:.25rem}
 .brain-row{display:flex;justify-content:space-between;align-items:center;padding:.6rem .75rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-bottom:.5rem;font-size:.8rem;gap:.5rem;flex-wrap:wrap}
-.latency{font-size:.7rem;font-weight:600;color:var(--success);background:var(--success-soft);padding:.1rem .4rem;border-radius:4px}
+.latency{font-size:.7rem;font-weight:600;color:var(--success);background:${isDark?'rgba(0,255,136,.1)':'#ecfdf5'};padding:.1rem .4rem;border-radius:4px}
 .client-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.75rem}
 .client-item{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:1rem;text-align:center;font-size:.75rem;transition:.2s}
 .client-item:hover{border-color:var(--primary);box-shadow:0 0 15px var(--glow)}
@@ -562,7 +567,7 @@ label.lbl{display:block;margin-bottom:.25rem;font-size:.75rem;color:var(--muted)
   <div class="header">
     <div class="logo">APP Panel</div>
     <div class="top-bar-actions">
-      <a href="?lang=${isFa?'en':'fa'}&theme=${isDark?'dark':'dark'}" class="btn-ghost btn-sm">${isFa?'EN':'FA'}</a>
+      <a href="?lang=${isFa?'en':'fa'}&theme=${theme}" class="btn-ghost btn-sm">${isFa?'EN':'FA'}</a>
       <a href="?lang=${lang}&theme=${isDark?'light':'dark'}" class="btn-ghost btn-sm">${isDark?'☀️':'🌙'}</a>
       <button class="btn-ghost btn-sm" onclick="logout()">${isFa ? 'خروج' : 'Logout'}</button>
     </div>
@@ -742,8 +747,6 @@ label.lbl{display:block;margin-bottom:.25rem;font-size:.75rem;color:var(--muted)
 
 <script>
 const isFa = ${isFa ? 'true' : 'false'};
-const isDark = ${isDark ? 'true' : 'false'};
-const themeUrl = '?lang=${lang}&theme=${isDark?'light':'dark'}';
 let settings = {}, subs = [], users = [];
 let brainMode = 'proxy';
 
@@ -1146,7 +1149,7 @@ export default {
       const upgrade = request.headers.get('Upgrade') || '';
       if (upgrade.toLowerCase() === 'websocket') {
         const settings = await getSettings(env);
-        return handleVLESSWebSocket(request, env, settings, null, ctx);
+        return handleVLESSWebSocket(request, env, settings, ctx);
       }
 
       if (path.startsWith(API_PATH)) {
@@ -1181,8 +1184,9 @@ export default {
             const remainDays = user.expire ? Math.max(0, Math.ceil((new Date(user.expire) - new Date()) / 86400000)) : '∞';
             const isDark = theme !== 'light';
             const isFa = lang !== 'en';
+            const c = getThemeStyles(isDark);
             
-            return new Response(`<!DOCTYPE html><html lang="${isFa ? 'fa' : 'en'}" dir="${isFa ? 'rtl' : 'ltr'}"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Subscription Info</title><style>@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700&family=Inter:wght@400;600;700&display=swap');:root{--bg:${isDark?'#030303':'#f8fafc'};--card:${isDark?'#0a0f0a':'#ffffff'};--text:${isDark?'#e8ffe8':'#1e293b'};--muted:${isDark?'#6b8f6b':'#64748b'};--primary:${isDark?'#00ff88':'#4f46e5'};--border:${isDark?'rgba(0,255,136,.15)':'#e2e8f0'};--glow:${isDark?'rgba(0,255,136,.35)':'rgba(79,70,229,.2)'}}*{box-sizing:border-box;margin:0;padding:0;font-family:${isFa?'Vazirmatn':'Inter'},sans-serif}body{background:var(--bg);color:var(--text);display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background-image:${isDark?'linear-gradient(rgba(0,255,136,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(0,255,136,.02) 1px,transparent 1px)':'none'};background-size:40px 40px}.box{background:var(--card);padding:2rem;border-radius:16px;box-shadow:0 0 30px var(--glow);text-align:center;max-width:400px;width:90%;border:1px solid var(--border)}h1{color:var(--primary);margin-bottom:1rem;text-shadow:0 0 10px var(--glow)}.info{background:var(--bg);padding:1rem;border-radius:8px;margin:.5rem 0;text-align:right;border:1px solid var(--border)}.info strong{color:var(--muted);display:block;font-size:.8rem}.info span{font-size:1.2rem;font-weight:700;color:var(--text)}.btn{display:inline-block;margin-top:1.5rem;padding:.8rem 1.5rem;background:var(--primary);color:${isDark?'#000':'#fff'};text-decoration:none;border-radius:8px;font-weight:600;box-shadow:0 0 15px var(--glow)}.top-bar{position:fixed;top:1rem;left:1rem;display:flex;gap:.5rem}.tb-btn{background:var(--card);border:1px solid var(--border);color:var(--muted);padding:.35rem .65rem;border-radius:8px;cursor:pointer;font-size:.75rem;text-decoration:none}</style></head><body><div class="top-bar"><a href="?lang=${isFa?'en':'fa'}&theme=${isDark?'light':'dark'}" class="tb-btn">${isFa?'EN':'FA'}</a><a href="?lang=${lang}&theme=${isDark?'light':'dark'}" class="tb-btn">${isDark?'☀️':'🌙'}</a></div><div class="box"><h1>APP Panel</h1><div class="info"><strong>${isFa?'نام کاربری':'Username'}</strong><span>${user.name}</span></div><div class="info"><strong>${isFa?'مصرف ترافیک':'Traffic Usage'}</strong><span>${usedGB} / ${totalGB} GB</span></div><div class="info"><strong>${isFa?'تاریخ انقضا':'Expiry Date'}</strong><span>${user.expire || 'Unlimited'}</span></div><div class="info"><strong>${isFa?'روزهای باقی‌مانده':'Remaining Days'}</strong><span>${remainDays}</span></div><a href="v2rayng://install-sub?url=${url.origin}/sub/${user.id}" class="btn">${isFa?'افزودن به v2rayNG':'Import to v2rayNG'}</a></div></body></html>`, { headers: { 'Content-Type': 'text/html;charset=utf-8' }});
+            return new Response(`<!DOCTYPE html><html lang="${isFa ? 'fa' : 'en'}" dir="${isFa ? 'rtl' : 'ltr'}"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Subscription Info</title><style>@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700&family=Inter:wght@400;600;700&display=swap');:root{--bg:${c.bg};--card:${c.card};--text:${c.text};--muted:${c.muted};--primary:${c.primary};--border:${c.border};--glow:${c.glow}}*{box-sizing:border-box;margin:0;padding:0;font-family:${isFa?'Vazirmatn':'Inter'},sans-serif}body{background:var(--bg);color:var(--text);display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background-image:${c.bgImage};background-size:40px 40px}.box{background:var(--card);padding:2rem;border-radius:16px;box-shadow:0 0 30px var(--glow);text-align:center;max-width:400px;width:90%;border:1px solid var(--border)}h1{color:var(--primary);margin-bottom:1rem;text-shadow:0 0 10px var(--glow)}.info{background:var(--bg);padding:1rem;border-radius:8px;margin:.5rem 0;text-align:right;border:1px solid var(--border)}.info strong{color:var(--muted);display:block;font-size:.8rem}.info span{font-size:1.2rem;font-weight:700;color:var(--text)}.btn{display:inline-block;margin-top:1.5rem;padding:.8rem 1.5rem;background:var(--primary);color:${isDark?'#000':'#fff'};text-decoration:none;border-radius:8px;font-weight:600;box-shadow:0 0 15px var(--glow)}.top-bar{position:fixed;top:1rem;left:1rem;display:flex;gap:.5rem}.tb-btn{background:var(--card);border:1px solid var(--border);color:var(--muted);padding:.35rem .65rem;border-radius:8px;cursor:pointer;font-size:.75rem;text-decoration:none}</style></head><body><div class="top-bar"><a href="/sub/${user.id}?lang=${isFa?'en':'fa'}&theme=${theme}" class="tb-btn">${isFa?'EN':'FA'}</a><a href="/sub/${user.id}?lang=${lang}&theme=${isDark?'light':'dark'}" class="tb-btn">${isDark?'☀️':'🌙'}</a></div><div class="box"><h1>APP Panel</h1><div class="info"><strong>${isFa?'نام کاربری':'Username'}</strong><span>${user.name}</span></div><div class="info"><strong>${isFa?'مصرف ترافیک':'Traffic Usage'}</strong><span>${usedGB} / ${totalGB} GB</span></div><div class="info"><strong>${isFa?'تاریخ انقضا':'Expiry Date'}</strong><span>${user.expire || 'Unlimited'}</span></div><div class="info"><strong>${isFa?'روزهای باقی‌مانده':'Remaining Days'}</strong><span>${remainDays}</span></div><a href="v2rayng://install-sub?url=${url.origin}/sub/${user.id}" class="btn">${isFa?'افزودن به v2rayNG':'Import to v2rayNG'}</a></div></body></html>`, { headers: { 'Content-Type': 'text/html;charset=utf-8' }});
           }
 
           return new Response(generateUserSubContent(user, sub, settings, host), {
