@@ -3,9 +3,10 @@ main = "worker.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-# اطلاعات دیتابیس D1 خود را در این بخش قرار دهید:
 [[d1_databases]]
 binding = "APP_DB"
+database_name = "databased1"
+database_id = "5bb0ac39-3876-41c4-87d9-1371179d069e"DB"
 database_name = "databased1"
 database_id = "اینجا_آیدی_دیتابیس_خودت_رو_بذار"
 
