@@ -1,9 +1,8 @@
-name = "app-panel"
+name = "sinapanel"
 main = "worker.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-# دیتابیس KV برای ذخیره کاربران، حجم و جلسات آنلاین
 [[kv_namespaces]]
 binding = "APP_KV"
-id = "YOUR_KV_NAMESPACE_ID_HERE"
+id = "d922e1eee9af42f5beb3fa5104c9c10b"

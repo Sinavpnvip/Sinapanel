@@ -1,10 +1,8 @@
 /**
  * ═══════════════════════════════════════════════════════════════
- *   APP Panel · Advanced Proxy Panel v2.0 (Real Multi-User)
- *   پنل پروکسی پیشرفته و واقعی — پشتیبانی کامل از کاربران، ترافیک و Trojan
+ *   SinaPanel / APP Panel · Advanced Proxy System v2.0
+ *   پشتیبانی کامل از VLESS, Trojan, محاسبه واقعی ترافیک و ساب‌لینک
  * ═══════════════════════════════════════════════════════════════
- *  Default Password: 123456
- *  Requires KV binding: APP_KV
  */
 
 import { connect } from 'cloudflare:sockets';
@@ -15,16 +13,9 @@ const SUB_PATH = '/sub';
 const DOH_PATH = '/doh';
 const API_PATH = '/api';
 
-// Memory cache for active byte counts to minimize KV writes
-const trafficBuffer = new Map();
-
-// ──────────────────────────── Crypto & Utils ────────────────────────────
+// ──────────────────────────── Crypto & Helpers ────────────────────────────
 function uuid() {
   return crypto.randomUUID();
-}
-
-function isValidUUID(u) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(u);
 }
 
 async function sha224Hex(str) {
@@ -62,21 +53,17 @@ function redirect(url) {
   return Response.redirect(url, 302);
 }
 
-// ──────────────────────────── Default Settings ────────────────────────────
+// ──────────────────────────── KV Operations ────────────────────────────
 function defaultSettings() {
   return {
     password: DEFAULT_PASSWORD,
     uuid: uuid(),
-    trojanPassword: 'trojan' + Math.random().toString(36).slice(2, 10),
-    fingerprint: 'chrome',
-    fragment: { length: '10-20', interval: '10-20', packets: 'tlshello' },
-    warp: { enabled: false, pro: false, endpoint: '' },
+    trojanPassword: 'tr-' + Math.random().toString(36).slice(2, 10),
     proxyIP: '',
     cleanIPs: []
   };
 }
 
-// ──────────────────────────── KV Helpers ────────────────────────────
 async function getSettings(env) {
   if (!env.APP_KV) return defaultSettings();
   const raw = await env.APP_KV.get('settings', 'json');
@@ -121,7 +108,7 @@ async function addTrafficToUser(env, userId, bytes) {
   }
 }
 
-// ──────────────────────────── Auth ────────────────────────────
+// ──────────────────────────── Session Auth ────────────────────────────
 async function checkAuth(request, env) {
   const cookie = request.headers.get('Cookie') || '';
   const match = cookie.match(/app_token=([^;]+)/);
@@ -140,7 +127,7 @@ async function createSession(env) {
   return token;
 }
 
-// ──────────────────────────── Sub Generators ────────────────────────────
+// ──────────────────────────── Config Generators ────────────────────────────
 function generateVlessLink(host, userUuid, port, path, remark, proxyIP) {
   const address = proxyIP || host;
   const params = new URLSearchParams({
@@ -173,7 +160,6 @@ function generateUserSubContent(user, settings, subs, host) {
   const userUuid = user.uuid || settings.uuid;
   const trojanPass = user.trojanPassword || settings.trojanPassword;
 
-  // Global defaults if no sub templates exist
   if (!subs || subs.length === 0) {
     subs = [{
       name: 'Standard',
@@ -195,7 +181,7 @@ function generateUserSubContent(user, settings, subs, host) {
     if (sub.protocols?.vless !== false) {
       links.push(generateVlessLink(host, userUuid, port, path, baseRemark, proxyIP));
       for (let i = 0; i < cleanIPs.length; i++) {
-        links.push(generateVlessLink(host, userUuid, port, path, `${baseRemark}-IP${i + 1}`, cleanIPs[i]));
+        links.push(generateVlessLink(host, userUuid, port, path, `${baseRemark}-Clean${i + 1}`, cleanIPs[i]));
       }
     }
     if (sub.protocols?.trojan) {
@@ -206,9 +192,9 @@ function generateUserSubContent(user, settings, subs, host) {
   return btoa(links.join('\n'));
 }
 
-// ──────────────────────────── Header Parsers ────────────────────────────
+// ──────────────────────────── Header Decoders ────────────────────────────
 function processVlessHeader(buffer) {
-  if (buffer.byteLength < 24) return { hasError: true, message: 'invalid header' };
+  if (buffer.byteLength < 24) return { hasError: true };
   const view = new DataView(buffer);
   const version = new Uint8Array(buffer.slice(0, 1))[0];
   const uuidBytes = new Uint8Array(buffer.slice(1, 17));
@@ -217,7 +203,7 @@ function processVlessHeader(buffer) {
 
   const optLen = new Uint8Array(buffer.slice(17, 18))[0];
   const cmd = new Uint8Array(buffer.slice(18 + optLen, 19 + optLen))[0];
-  if (cmd !== 1 && cmd !== 2) return { hasError: true, message: 'unsupported command' };
+  if (cmd !== 1 && cmd !== 2) return { hasError: true };
 
   const portIndex = 19 + optLen;
   const portRemote = view.getUint16(portIndex);
@@ -245,7 +231,7 @@ function processVlessHeader(buffer) {
       addressRemote = ipv6.join(':');
       break;
     default:
-      return { hasError: true, message: 'invalid address type' };
+      return { hasError: true };
   }
 
   const rawDataIndex = addressIndex + addressLength;
@@ -261,12 +247,12 @@ function processVlessHeader(buffer) {
 }
 
 async function processTrojanHeader(buffer) {
-  if (buffer.byteLength < 58) return { hasError: true, message: 'invalid trojan header' };
+  if (buffer.byteLength < 58) return { hasError: true };
   const hexBytes = new Uint8Array(buffer.slice(0, 56));
   const recvHash = new TextDecoder().decode(hexBytes);
   
   const view = new DataView(buffer);
-  const cmd = view.getUint8(58); // 1 = TCP, 3 = UDP
+  const cmd = view.getUint8(58);
   const addressType = view.getUint8(59);
   
   let addressIndex = 60;
@@ -290,12 +276,12 @@ async function processTrojanHeader(buffer) {
       addressRemote = ipv6.join(':');
       break;
     default:
-      return { hasError: true, message: 'invalid trojan addr type' };
+      return { hasError: true };
   }
 
   const portIndex = addressIndex + addressLength;
   const portRemote = view.getUint16(portIndex);
-  const rawDataIndex = portIndex + 4; // Skip CRLF
+  const rawDataIndex = portIndex + 4;
 
   return {
     hasError: false,
@@ -322,7 +308,7 @@ function makeReadableWebSocketStream(webSocket, earlyData) {
   });
 }
 
-// ──────────────────────────── Core Proxy Stream ────────────────────────────
+// ──────────────────────────── Core Proxy Handler ────────────────────────────
 async function handleProxyWebSocket(request, env, settings) {
   const webSocketPair = new WebSocketPair();
   const [client, webSocket] = Object.values(webSocketPair);
@@ -352,23 +338,21 @@ async function handleProxyWebSocket(request, env, settings) {
       // 1. Try VLESS
       const parsedVless = processVlessHeader(chunk);
       if (!parsedVless.hasError) {
-        // Authenticate User
         const matchedUser = users.find(u => u.uuid === parsedVless.userUuid) ||
                             (parsedVless.userUuid.toLowerCase() === settings.uuid.toLowerCase() ? { id: 'admin', enabled: true } : null);
 
         if (!matchedUser || matchedUser.enabled === false) {
-          webSocket.close(1000, 'Unauthorized or User Disabled');
+          webSocket.close(1000, 'Unauthorized');
           return;
         }
 
-        // Check Traffic/Expiration
         if (matchedUser.id !== 'admin') {
           if (matchedUser.traffic > 0 && matchedUser.used >= matchedUser.traffic) {
-            webSocket.close(1000, 'Traffic Exceeded');
+            webSocket.close(1000, 'Traffic Limit Exceeded');
             return;
           }
           if (matchedUser.expire && new Date(matchedUser.expire) < new Date()) {
-            webSocket.close(1000, 'Account Expired');
+            webSocket.close(1000, 'Expired');
             return;
           }
           trackedUserId = matchedUser.id;
@@ -382,7 +366,6 @@ async function handleProxyWebSocket(request, env, settings) {
           await writer.write(chunk.slice(parsedVless.rawDataIndex));
           writer.releaseLock();
 
-          // Respond header VLESS
           webSocket.send(new Uint8Array([parsedVless.versionByte[0], 0]));
 
           sock.readable.pipeTo(new WritableStream({
@@ -422,7 +405,7 @@ async function handleProxyWebSocket(request, env, settings) {
 
         if (matchedUser.id !== 'admin') {
           if (matchedUser.traffic > 0 && matchedUser.used >= matchedUser.traffic) {
-            webSocket.close(1000, 'Traffic Limit Reached');
+            webSocket.close(1000, 'Traffic Limit Exceeded');
             return;
           }
           trackedUserId = matchedUser.id;
@@ -453,7 +436,6 @@ async function handleProxyWebSocket(request, env, settings) {
       webSocket.close(1000, 'Invalid Protocol');
     }
   })).then(async () => {
-    // Write usage on disconnect
     if (trackedUserId && totalBytesTransferred > 0) {
       await addTrafficToUser(env, trackedUserId, totalBytesTransferred);
     }
@@ -462,7 +444,7 @@ async function handleProxyWebSocket(request, env, settings) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-// ──────────────────────────── Panel HTML ────────────────────────────
+// ──────────────────────────── Dashboard UI ────────────────────────────
 function getPanelHTML(lang, authenticated) {
   const isFa = lang !== 'en';
   if (!authenticated) {
@@ -470,7 +452,7 @@ function getPanelHTML(lang, authenticated) {
 <html lang="${isFa ? 'fa' : 'en'}" dir="${isFa ? 'rtl' : 'ltr'}">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>APP Panel Login</title>
+<title>SinaPanel Login</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
 :root{--bg:#030303;--green:#00ff88;--glow:rgba(0,255,136,.35);--text:#e8ffe8;--muted:#6b8f6b;--border:rgba(0,255,136,.15)}
@@ -486,12 +468,12 @@ button{width:100%;padding:.7rem;background:var(--green);color:#000;border:none;b
 </head>
 <body>
 <div class="box">
-  <h1>APP Panel v2.0</h1>
-  <p>${isFa ? 'رمز عبور را وارد کنید' : 'Enter password'}</p>
+  <h1>SinaPanel v2.0</h1>
+  <p>${isFa ? 'رمز عبور مدیریت را وارد کنید' : 'Enter Admin Password'}</p>
   <form id="f">
     <input type="password" id="pass" placeholder="${isFa ? 'رمز عبور' : 'Password'}" autofocus>
     <button type="submit">${isFa ? 'ورود' : 'Login'}</button>
-    <div class="err" id="err">${isFa ? 'رمز اشتباه است' : 'Wrong password'}</div>
+    <div class="err" id="err">${isFa ? 'رمز عبور اشتباه است' : 'Invalid Password'}</div>
   </form>
 </div>
 <script>
@@ -508,10 +490,10 @@ document.getElementById('f').onsubmit=async e=>{
 <html lang="${isFa ? 'fa' : 'en'}" dir="${isFa ? 'rtl' : 'ltr'}">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>APP Panel v2.0</title>
+<title>SinaPanel Dashboard</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-:root{--bg:#030303;--card:#0a0f0a;--green:#00ff88;--g2:#00cc6a;--glow:rgba(0,255,136,.35);--soft:rgba(0,255,136,.1);--text:#e8ffe8;--muted:#6b8f6b;--border:rgba(0,255,136,.15);--border2:rgba(0,255,136,.3);--red:#ff4d6a;--blue:#4cc9f0}
+:root{--bg:#030303;--card:#0a0f0a;--green:#00ff88;--g2:#00cc6a;--glow:rgba(0,255,136,.35);--soft:rgba(0,255,136,.1);--text:#e8ffe8;--muted:#6b8f6b;--border:rgba(0,255,136,.15);--border2:rgba(0,255,136,.3);--red:#ff4d6a}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:Inter,system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;line-height:1.5}
 .container{max-width:1080px;margin:0 auto;padding:1rem .9rem 3rem}
@@ -548,21 +530,19 @@ input,select{width:100%;padding:.5rem;background:rgba(0,0,0,.45);border:1px soli
 <body>
 <div class="container">
   <div class="header">
-    <div class="logo">APP Panel v2.0</div>
-    <div>
-      <button class="btn-outline btn-sm" onclick="logout()">${isFa ? 'خروج' : 'Logout'}</button>
-    </div>
+    <div class="logo">SinaPanel v2.0</div>
+    <div><button class="btn-outline btn-sm" onclick="logout()">${isFa ? 'خروج' : 'Logout'}</button></div>
   </div>
   <div class="nav">
     <a class="active" onclick="tab('dash')">${isFa ? 'داشبورد' : 'Dashboard'}</a>
-    <a onclick="tab('users')">${isFa ? 'کاربران (واقعی)' : 'Users'}</a>
-    <a onclick="tab('subs')">${isFa ? 'قالب ساب‌لینک' : 'Sub Templates'}</a>
+    <a onclick="tab('users')">${isFa ? 'مدیریت کاربران' : 'Users'}</a>
+    <a onclick="tab('subs')">${isFa ? 'قالب ساب‌لینک' : 'Templates'}</a>
     <a onclick="tab('set')">${isFa ? 'تنظیمات' : 'Settings'}</a>
   </div>
 
   <div id="tab-dash">
     <div class="card">
-      <h2>${isFa ? 'وضعیت سیستم' : 'System Overview'}</h2>
+      <h2>${isFa ? 'خلاصه وضعیت سیستم' : 'System Overview'}</h2>
       <div class="stats">
         <div class="stat"><div class="stat-value" id="sUsers">0</div><div class="stat-label">${isFa ? 'کل کاربران' : 'Total Users'}</div></div>
         <div class="stat"><div class="stat-value" id="sActiveUsers">0</div><div class="stat-label">${isFa ? 'کاربران فعال' : 'Active Users'}</div></div>
@@ -595,8 +575,8 @@ input,select{width:100%;padding:.5rem;background:rgba(0,0,0,.45);border:1px soli
     <div class="card">
       <h2>${isFa ? 'تنظیمات عمومی پروکسی' : 'Global Settings'}</h2>
       <label>${isFa ? 'پروکسی آی‌پی (Proxy IP)' : 'Proxy IP'}</label>
-      <input id="setProxyIP" placeholder="e.g. 104.16.128.50">
-      <label>${isFa ? 'رمز عمومی ترجان' : 'Default Trojan Password'}</label>
+      <input id="setProxyIP" placeholder="104.16.128.50">
+      <label>${isFa ? 'رمز پیش‌فرض ترجان' : 'Default Trojan Password'}</label>
       <input id="setTrojan">
       <button onclick="saveSettings()">${isFa ? 'ذخیره تنظیمات' : 'Save Settings'}</button>
     </div>
@@ -606,7 +586,7 @@ input,select{width:100%;padding:.5rem;background:rgba(0,0,0,.45);border:1px soli
 <!-- Modal User -->
 <div class="modal-bg" id="modalUser">
   <div class="modal">
-    <h3 id="userModalTitle">${isFa ? 'کاربر جدید' : 'New User'}</h3>
+    <h3>${isFa ? 'افزودن کاربر جدید' : 'New User'}</h3>
     <input type="hidden" id="userId">
     <label>${isFa ? 'نام کاربر' : 'Username'}</label>
     <input id="userName" placeholder="e.g. Ali">
@@ -627,11 +607,11 @@ input,select{width:100%;padding:.5rem;background:rgba(0,0,0,.45);border:1px soli
     <h3>${isFa ? 'قالب ساب‌لینک' : 'Sub Template'}</h3>
     <input type="hidden" id="subId">
     <label>${isFa ? 'نام قالب' : 'Template Name'}</label>
-    <input id="subName" placeholder="Direct-CF">
+    <input id="subName" placeholder="CF-Direct">
     <label>${isFa ? 'پورت' : 'Port'}</label>
     <input type="number" id="subPort" value="443">
-    <label>${isFa ? 'Clean IPs (هر خط یکی)' : 'Clean IPs'}</label>
-    <input id="subCleanIPs" placeholder="104.21.48.10">
+    <label>${isFa ? 'Clean IPs (هر آی‌پی در یک خط)' : 'Clean IPs'}</label>
+    <textarea id="subCleanIPs" style="width:100%;height:60px;background:rgba(0,0,0,.45);border:1px solid var(--border);color:var(--text);border-radius:7px;padding:.5rem;margin-bottom:.4rem" placeholder="104.21.48.10"></textarea>
     <div style="display:flex;gap:.4rem;margin-top:.8rem">
       <button onclick="saveSub()">${isFa ? 'ذخیره' : 'Save'}</button>
       <button class="btn-outline" onclick="closeModal('modalSub')">${isFa ? 'انصراف' : 'Cancel'}</button>
@@ -673,9 +653,8 @@ function render(){
   document.getElementById('setProxyIP').value = settings.proxyIP || '';
   document.getElementById('setTrojan').value = settings.trojanPassword || '';
 
-  // Render Users
   const ul = document.getElementById('usersList');
-  if(!users.length) { ul.innerHTML = '<p style="color:var(--muted)">' + (isFa?'کاربری وجود ندارد':'No users found') + '</p>'; }
+  if(!users.length) { ul.innerHTML = '<p style="color:var(--muted)">' + (isFa?'هیچ کاربر متصلی پیدا نشد':'No users created yet') + '</p>'; }
   else {
     ul.innerHTML = users.map(u => {
       const subUrl = location.origin + '/sub/' + (u.uuid || u.id);
@@ -690,19 +669,18 @@ function render(){
         '<div><strong>' + u.name + '</strong> ' + (isActive ? '<span class="badge">' + (isFa?'فعال':'Active') + '</span>' : '<span class="badge badge-red">' + (isFa?'غیرفعال':'Disabled') + '</span>') + '</div>' +
         '<div style="display:flex;gap:.3rem">' +
         '<button class="btn-outline btn-sm" onclick="copyText(\\'' + subUrl + '\\')">' + (isFa?'کپی ساب':'Copy Sub') + '</button>' +
-        '<button class="btn-outline btn-sm" onclick="toggleUser(\\'' + u.id + '\\')">' + (u.enabled!==false?(isFa?'غیرفعال‌سازی':'Disable'):(isFa?'فعال‌سازی':'Enable')) + '</button>' +
-        '<button class="btn-outline btn-sm" onclick="resetUser(\\'' + u.id + '\\')">' + (isFa?'ریست حجم':'Reset Traffic') + '</button>' +
+        '<button class="btn-outline btn-sm" onclick="toggleUser(\\'' + u.id + '\\')">' + (u.enabled!==false?(isFa?'غیرفعال':'Disable'):(isFa?'فعال':'Enable')) + '</button>' +
+        '<button class="btn-outline btn-sm" onclick="resetUser(\\'' + u.id + '\\')">' + (isFa?'صفر کردن حجم':'Reset') + '</button>' +
         '<button class="btn-danger btn-sm" onclick="delUser(\\'' + u.id + '\\')">' + (isFa?'حذف':'Delete') + '</button>' +
         '</div></div>' +
         '<div class="progress-wrap"><div class="progress-head"><span>' + (isFa?'مصرف ترافیک':'Traffic') + '</span><span>' + used + ' / ' + total + ' GB</span></div>' +
         '<div class="progress-bar"><div class="progress-fill" style="width:' + pct + '%"></div></div></div>' +
         '<div class="config-box">' + subUrl + '</div>' +
-        '<div style="font-size:.7rem;color:var(--muted)">UUID: ' + u.uuid + ' | ' + (isFa?'انقضا':'Exp') + ': ' + (u.expire || 'Permanent') + '</div>' +
+        '<div style="font-size:.7rem;color:var(--muted)">UUID: ' + u.uuid + ' | ' + (isFa?'تاریخ انقضا':'Expire') + ': ' + (u.expire || 'Permanent') + '</div>' +
         '</div>';
     }).join('');
   }
 
-  // Render Subs
   const sl = document.getElementById('subsList');
   if(!subs.length) { sl.innerHTML = '<p style="color:var(--muted)">' + (isFa?'قالبی وجود ندارد':'No templates') + '</p>'; }
   else {
@@ -716,7 +694,7 @@ function render(){
   }
 }
 
-function copyText(t){navigator.clipboard.writeText(t).then(()=>toast(isFa?'لینک کپی شد':'Copied'))}
+function copyText(t){navigator.clipboard.writeText(t).then(()=>toast(isFa?'لینک ساب‌لینک کپی شد':'Copied'))}
 
 function openUserModal(){
   document.getElementById('userId').value='';
@@ -748,7 +726,7 @@ async function toggleUser(id){
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ id: u.id, enabled: u.enabled === false ? true : false })
   });
-  toast(isFa?'تغییر کرد':'Updated');
+  toast(isFa?'وضعیت تغییر کرد':'Status updated');
   loadAll();
 }
 
@@ -758,12 +736,12 @@ async function resetUser(id){
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ id })
   });
-  toast(isFa?'ترافیک صفر شد':'Traffic Reset');
+  toast(isFa?'حجم مصرفی صفر شد':'Traffic reset');
   loadAll();
 }
 
 async function delUser(id){
-  if(!confirm(isFa?'حذف شود؟':'Delete?')) return;
+  if(!confirm(isFa?'آیا از حذف این کاربر اطمینان دارید؟':'Delete?')) return;
   await fetch('/api/users?id='+id, {method: 'DELETE'});
   toast(isFa?'حذف شد':'Deleted');
   loadAll();
@@ -926,7 +904,7 @@ async function handleAPI(request, env, path) {
   return json({ error: 'not found' }, 404);
 }
 
-// ──────────────────────────── Main Export ────────────────────────────
+// ──────────────────────────── Main Entry Point ────────────────────────────
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -935,26 +913,25 @@ export default {
       const host = url.hostname;
       const lang = url.searchParams.get('lang') || 'fa';
 
-      // 1. WebSocket Upgrade -> Proxy Handler
+      // 1. WebSocket Upgrade Handler
       const upgrade = request.headers.get('Upgrade') || '';
       if (upgrade.toLowerCase() === 'websocket') {
         const settings = await getSettings(env);
         return await handleProxyWebSocket(request, env, settings);
       }
 
-      // 2. API Endpoint
+      // 2. API Endpoints
       if (path.startsWith(API_PATH)) {
         return await handleAPI(request, env, path);
       }
 
-      // 3. Subscription Link Endpoint (/sub/:user_token)
+      // 3. User Subscription Link (/sub/:user_id)
       if (path.startsWith(SUB_PATH + '/')) {
         const token = path.slice(SUB_PATH.length + 1).split('/')[0];
         const settings = await getSettings(env);
         const users = await getUsers(env);
         const subs = await getSubs(env);
 
-        // Find matching user by UUID or ID
         const user = users.find(u => u.uuid === token || u.id === token);
 
         if (!user) {
@@ -965,7 +942,6 @@ export default {
           return new Response('User Disabled', { status: 403 });
         }
 
-        // Build User Sub Info Header (for v2rayNG / Shadowrocket progress bar)
         const usedBytes = Math.floor((user.used || 0) * 1024 * 1024 * 1024);
         const totalBytes = Math.floor((user.traffic || 0) * 1024 * 1024 * 1024);
         const expireTs = user.expire ? Math.floor(new Date(user.expire).getTime() / 1000) : 0;
@@ -981,7 +957,7 @@ export default {
         });
       }
 
-      // 4. DoH
+      // 4. DoH Resolver
       if (path.startsWith(DOH_PATH)) {
         return fetch('https://cloudflare-dns.com/dns-query' + url.search, {
           method: request.method,
@@ -993,14 +969,14 @@ export default {
         });
       }
 
-      // 5. Panel
+      // 5. Panel Routing
       if (path === PANEL_PATH || path === PANEL_PATH + '/' || path === '/') {
         if (path === '/') return redirect(`${url.origin}${PANEL_PATH}?lang=${lang}`);
         const authed = await checkAuth(request, env);
         return html(getPanelHTML(lang, authed));
       }
 
-      return new Response('APP Panel v2.0 is running.\nGo to /panel', { status: 200 });
+      return new Response('SinaPanel v2.0 is Active.\nGo to /panel', { status: 200 });
     } catch (err) {
       return new Response('Error: ' + (err.message || String(err)), { status: 500 });
     }
