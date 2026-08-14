@@ -1,16 +1,14 @@
+name = "app-panel"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# اطلاعات دیتابیس D1 خود را در این بخش قرار دهید:
 [[d1_databases]]
 binding = "APP_DB"
-database_name = "app_panel_db"
-database_id = "ID_دیتابیس_شما"at"]
+database_name = "databased1"
+database_id = "اینجا_آیدی_دیتابیس_خودت_رو_بذار"
 
-# Uncomment and set your KV namespace after creating it:
-# [[kv_namespaces]]
-# binding = "APP_KV"
-# id = "your_kv_namespace_id"
-
-# Optional environment variables (can also set in dashboard):
+# متغیرهای محیطی (اختیاری):
 # [vars]
 # PASSWORD = "123456"
-# UUID = "your-uuid-here"
-# TROJAN_PASS = "your-trojan-password"
-# PROXYIP = ""
