@@ -1,7 +1,7 @@
 /**
  * ═══════════════════════════════════════════════════════════════
- *   APP Panel  ·  Enterprise Proxy Panel  v3.0 (Ultimate Edition)
- *   Engineered for High Performance, D1 Database, and Zero-Bug Routing
+ *   APP Panel  ·  Enterprise Proxy Panel  v3.1 (CORS & API Fix)
+ *   رفع مشکل ذخیره نشدن کاربران و ساب‌لینک‌ها
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -35,13 +35,16 @@ function base64ToArrayBuffer(base64Str) {
   }
 }
 
+// اصلاح هدرها برای رفع مشکل CORS و ذخیره نشدن اطلاعات
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: { 
       'Content-Type': 'application/json;charset=utf-8', 
       'Cache-Control': 'no-store',
-      'Access-Control-Allow-Origin': '*'
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type'
     }
   });
 }
@@ -297,11 +300,6 @@ function makeReadableWebSocketStream(webSocket, earlyData) {
   });
 }
 
-/**
- * High-Performance WebSocket Handler
- * Accepts connection instantly to prevent client timeout/ping failure.
- * Resolves user UUID asynchronously from D1.
- */
 async function handleVLESSWebSocket(request, env, settings, ctx) {
   const webSocketPair = new WebSocketPair();
   const [client, webSocket] = Object.values(webSocketPair);
@@ -338,7 +336,6 @@ async function handleVLESSWebSocket(request, env, settings, ctx) {
             webSocket.close(1000, 'account expired');
           }
           
-          // Buffer DB writes to every 5MB to avoid D1 rate limits
           if (accumulatedBytes > 5242880) {
             const bytesToSave = accumulatedBytes;
             accumulatedBytes = 0;
@@ -412,7 +409,7 @@ async function handleVLESSWebSocket(request, env, settings, ctx) {
     if (userResolved && currentUser && env.APP_DB && accumulatedBytes > 0) {
       await updateUserTraffic(env, currentUser.id, accumulatedBytes);
     }
-    await dbSavePromise; // Ensure final DB write completes
+    await dbSavePromise;
   });
 
   return new Response(null, { status: 101, webSocket: client });
@@ -539,6 +536,7 @@ label.lbl{display:block;margin-bottom:.25rem;font-size:.75rem;color:var(--muted)
 .grid{display:grid;gap:.75rem}@media(min-width:560px){.grid-2{grid-template-columns:1fr 1fr}}
 .toast{position:fixed;bottom:1.5rem;left:1.5rem;background:var(--primary);color:${isDark?'#000':'#fff'};padding:.75rem 1.25rem;border-radius:8px;font-weight:500;font-size:.85rem;opacity:0;transform:translateY(10px);transition:.3s;z-index:90;box-shadow:0 0 20px var(--glow)}
 .toast.show{opacity:1;transform:translateY(0)}
+.toast.err{background:var(--danger);color:#fff}
 .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.8);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;z-index:80;padding:1rem}
 .modal-bg.show{display:flex}
 .modal{background:var(--card);border:1px solid var(--primary);border-radius:16px;padding:1.5rem;max-width:480px;width:100%;max-height:92vh;overflow-y:auto;box-shadow:0 0 30px var(--glow)}
@@ -750,7 +748,13 @@ const isFa = ${isFa ? 'true' : 'false'};
 let settings = {}, subs = [], users = [];
 let brainMode = 'proxy';
 
-function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2000)}
+function toast(m, isErr=false){
+  const t=document.getElementById('toast');
+  t.textContent=m;
+  t.className = 'toast show' + (isErr ? ' err' : '');
+  setTimeout(()=>t.className='toast', 3000);
+}
+
 function openModal(id){document.getElementById(id).classList.add('show')}
 function closeModal(id){document.getElementById(id).classList.remove('show')}
 async function logout(){await fetch('/api/logout',{method:'POST'});location.reload()}
@@ -766,13 +770,17 @@ document.querySelectorAll('.nav a[data-t]').forEach(a=>{
 });
 
 async function loadAll(){
-  const [s,sb,u] = await Promise.all([
-    fetch('/api/settings').then(r=>r.json()),
-    fetch('/api/subs').then(r=>r.json()),
-    fetch('/api/users').then(r=>r.json())
-  ]);
-  settings=s; subs=sb; users=u;
-  render();
+  try {
+    const [s,sb,u] = await Promise.all([
+      fetch('/api/settings').then(r=>r.json()),
+      fetch('/api/subs').then(r=>r.json()),
+      fetch('/api/users').then(r=>r.json())
+    ]);
+    settings=s; subs=sb; users=u;
+    render();
+  } catch(e) {
+    toast(isFa?'خطا در بارگذاری اطلاعات':'Error loading data', true);
+  }
 }
 
 function render(){
@@ -886,14 +894,25 @@ async function saveSub(){
     cleanIPs: document.getElementById('subCleanIPs').value.split('\\n').map(s=>s.trim()).filter(Boolean),
     routing: {adblock: document.getElementById('subAdblock').checked, iran: document.getElementById('subIran').checked}
   };
-  const r = await fetch('/api/subs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(r.ok){closeModal('modalSub');toast(isFa?'با موفقیت ذخیره شد':'Saved successfully');loadAll()}
-  else toast('Error occurred');
+  try {
+    const r = await fetch('/api/subs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!r.ok) throw new Error('Server responded '+r.status);
+    closeModal('modalSub');
+    toast(isFa?'با موفقیت ذخیره شد':'Saved successfully');
+    await loadAll();
+  } catch(e) {
+    toast((isFa?'خطا: ':'Error: ')+e.message, true);
+  }
 }
 async function delSub(id){
   if(!confirm(isFa?'آیا از حذف مطمئن هستید؟':'Are you sure?'))return;
-  await fetch('/api/subs?id='+id,{method:'DELETE'});
-  toast(isFa?'حذف شد':'Deleted');loadAll();
+  try {
+    await fetch('/api/subs?id='+id,{method:'DELETE'});
+    toast(isFa?'حذف شد':'Deleted');
+    await loadAll();
+  } catch(e) {
+    toast((isFa?'خطا در حذف':'Error deleting'), true);
+  }
 }
 
 async function openBrain(mode){
@@ -963,18 +982,34 @@ async function saveUser(){
     note:document.getElementById('userNote').value||'',
     enabled:true
   };
-  const r=await fetch('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(r.ok){closeModal('modalUser');toast(isFa?'کاربر ذخیره شد':'User saved');loadAll()}
-  else toast('Error');
+  try {
+    const r=await fetch('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!r.ok) throw new Error('Server responded '+r.status);
+    closeModal('modalUser');
+    toast(isFa?'کاربر ذخیره شد':'User saved');
+    await loadAll();
+  } catch(e) {
+    toast((isFa?'خطا: ':'Error: ')+e.message, true);
+  }
 }
 async function delUser(id){
   if(!confirm(isFa?'حذف کاربر؟':'Delete user?'))return;
-  await fetch('/api/users?id='+id,{method:'DELETE'});
-  toast(isFa?'حذف شد':'Deleted');loadAll();
+  try {
+    await fetch('/api/users?id='+id,{method:'DELETE'});
+    toast(isFa?'حذف شد':'Deleted');
+    await loadAll();
+  } catch(e) {
+    toast((isFa?'خطا در حذف':'Error deleting'), true);
+  }
 }
 async function resetUser(id){
-  await fetch('/api/users/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
-  toast(isFa?'ترافیک ریست شد':'Traffic reset');loadAll();
+  try {
+    await fetch('/api/users/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+    toast(isFa?'ترافیک ریست شد':'Traffic reset');
+    await loadAll();
+  } catch(e) {
+    toast('Error', true);
+  }
 }
 
 async function saveSettings(){
@@ -983,25 +1018,43 @@ async function saveSettings(){
     fingerprint:document.getElementById('setFP').value,
     fragment:{length:document.getElementById('setFragLen').value,interval:document.getElementById('setFragInt').value,packets:'tlshello'}
   };
-  await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  toast(isFa?'تنظیمات ذخیره شد':'Settings saved');loadAll();
+  try {
+    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    toast(isFa?'تنظیمات ذخیره شد':'Settings saved');
+    await loadAll();
+  } catch(e) {
+    toast('Error', true);
+  }
 }
 async function newUUID(){
-  await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({newUUID:true})});
-  toast('New UUID generated');loadAll();
+  try {
+    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({newUUID:true})});
+    toast('New UUID generated');
+    await loadAll();
+  } catch(e) {
+    toast('Error', true);
+  }
 }
 async function changePass(){
   const p=document.getElementById('newPass').value;
   if(!p||p.length<4){toast(isFa?'حداقل ۴ کاراکتر':'Min 4 chars');return}
-  await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p})});
-  toast(isFa?'رمز تغییر کرد':'Password changed');
-  document.getElementById('newPass').value='';
+  try {
+    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p})});
+    toast(isFa?'رمز تغییر کرد':'Password changed');
+    document.getElementById('newPass').value='';
+  } catch(e) {
+    toast('Error', true);
+  }
 }
 async function saveWarp(){
-  await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-    warp:{enabled:document.getElementById('warpOn').checked,pro:document.getElementById('warpPro').checked,endpoint:document.getElementById('warpEndpoint').value}
-  })});
-  toast(isFa?'ذخیره شد':'Saved');
+  try {
+    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      warp:{enabled:document.getElementById('warpOn').checked,pro:document.getElementById('warpPro').checked,endpoint:document.getElementById('warpEndpoint').value}
+    })});
+    toast(isFa?'ذخیره شد':'Saved');
+  } catch(e) {
+    toast('Error', true);
+  }
 }
 
 loadAll();
@@ -1014,6 +1067,17 @@ async function handleAPI(request, env, path) {
   const url = new URL(request.url);
   const method = request.method;
 
+  // Handle CORS preflight
+  if (method === 'OPTIONS') {
+    return new Response(null, {
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type'
+      }
+    });
+  }
+
   if (path === '/api/login' && method === 'POST') {
     const body = await request.json().catch(() => ({}));
     const settings = await getSettings(env);
@@ -1022,6 +1086,7 @@ async function handleAPI(request, env, path) {
       return new Response(JSON.stringify({ ok: true }), {
         headers: {
           'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
           'Set-Cookie': `app_token=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${86400 * 7}`
         }
       });
@@ -1033,6 +1098,7 @@ async function handleAPI(request, env, path) {
     return new Response(JSON.stringify({ ok: true }), {
       headers: {
         'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
         'Set-Cookie': 'app_token=; Path=/; Max-Age=0'
       }
     });
