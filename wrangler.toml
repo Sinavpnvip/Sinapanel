@@ -10,12 +10,7 @@ compatibility_flags = ["nodejs_compat"]
 
 # Optional environment variables (can also set in dashboard):
 # [vars]
-# PASSWORD = "sfdns990"
+# PASSWORD = "123456"
 # UUID = "your-uuid-here"
 # TROJAN_PASS = "your-trojan-password"
 # PROXYIP = ""
-
-# IMPORTANT:
-# Create a KV namespace in Cloudflare and bind it to the Worker as APP_KV.
-# Keep the generated namespace id here (or configure the binding in the dashboard).
-# The Worker now returns a clear error when APP_KV is missing.
