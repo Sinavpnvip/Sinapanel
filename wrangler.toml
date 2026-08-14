@@ -1,4 +1,4 @@
-name = "app-panel"
+name = "sinapanel"
 main = "worker.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
