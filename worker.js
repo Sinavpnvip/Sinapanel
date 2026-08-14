@@ -1,11 +1,8 @@
 /**
  * ═══════════════════════════════════════════════════════════════
- *   APP Panel  ·  Advanced Proxy Panel  v1.2 (Real Edition)
- *   پنل پروکسی پیشرفته — نسخه واقعی و بدون باگ
+ *   APP Panel  ·  Advanced Proxy Panel  v1.3 (Pro UI Edition - Fixed)
+ *   پنل پروکسی پیشرفته — ظاهر حرفه‌ای و رفع باگ‌های دیپلوی
  * ═══════════════════════════════════════════════════════════════
- *  Default Password: 123456
- *  Works on Cloudflare Workers + Pages
- *  Requires KV binding: APP_KV
  */
 
 import { connect } from 'cloudflare:sockets';
@@ -150,7 +147,6 @@ function generateTrojanLink(host, password, port, path, remark, proxyIP) {
   return `trojan://${password}@${address}:${port}?${params.toString()}#${encodeURIComponent(remark || 'APP-Trojan')}`;
 }
 
-// تولید ساب برای کاربر خاص (با در نظر گرفتن حجم و انقضا)
 function generateUserSubContent(user, sub, settings, host) {
   const links = [];
   const port = sub.port || 443;
@@ -158,7 +154,6 @@ function generateUserSubContent(user, sub, settings, host) {
   const proxyIP = sub.proxyIP || settings.proxyIP || '';
   const cleanIPs = (sub.cleanIPs || settings.cleanIPs || []).filter(Boolean);
   
-  // اضافه کردن اطلاعات کاربر به نام کانفیگ
   const usedGB = (user.used / 1024 / 1024 / 1024).toFixed(2);
   const totalGB = user.traffic > 0 ? user.traffic : '∞';
   const remainingDays = user.expire ? Math.max(0, Math.ceil((new Date(user.expire) - new Date()) / 86400000)) : '∞';
@@ -178,7 +173,6 @@ function generateUserSubContent(user, sub, settings, host) {
   return btoa(links.join('\n'));
 }
 
-// تولید ساب عمومی برای پنل
 function generateSubContent(sub, settings, host) {
   const links = [];
   const port = sub.port || 443;
@@ -273,9 +267,8 @@ function makeReadableWebSocketStream(webSocket, earlyData) {
   });
 }
 
-// ── Updates User Traffic in KV ──
 async function updateUserTraffic(env, userId, bytesAdded) {
-  if (!env.APP_KV || !userId) return;
+  if (!env.APP_KV || !userId || bytesAdded === 0) return;
   try {
     let users = await getUsers(env);
     const idx = users.findIndex(u => u.id === userId);
@@ -286,7 +279,8 @@ async function updateUserTraffic(env, userId, bytesAdded) {
   } catch (e) {}
 }
 
-async function handleVLESSWebSocket(request, env, settings) {
+// Unified & Single Declaration of WebSocket Handler
+async function handleVLESSWebSocket(request, env, settings, currentUser, ctx) {
   const webSocketPair = new WebSocketPair();
   const [client, webSocket] = Object.values(webSocketPair);
   webSocket.accept();
@@ -296,8 +290,8 @@ async function handleVLESSWebSocket(request, env, settings) {
   const { data: earlyData } = base64ToArrayBuffer(earlyDataHeader);
   const readable = makeReadableWebSocketStream(webSocket, earlyData);
 
-  let currentUser = null;
   let isUserBlocked = false;
+  let accumulatedBytes = 0;
 
   readable.pipeTo(new WritableStream({
     async write(chunk) {
@@ -306,13 +300,11 @@ async function handleVLESSWebSocket(request, env, settings) {
         await writer.write(chunk);
         writer.releaseLock();
         
-        // Real Traffic Accounting
         if (currentUser && !isUserBlocked) {
           const chunkBytes = chunk.byteLength || chunk.length || 0;
-          currentUser.used += chunkBytes;
+          accumulatedBytes += chunkBytes;
           
-          // Check limits
-          if (currentUser.traffic > 0 && currentUser.used >= currentUser.traffic * 1024 * 1024 * 1024) {
+          if (currentUser.traffic > 0 && (currentUser.used + accumulatedBytes) >= currentUser.traffic * 1024 * 1024 * 1024) {
             isUserBlocked = true;
             webSocket.close(1000, 'traffic limit exceeded');
           }
@@ -321,9 +313,10 @@ async function handleVLESSWebSocket(request, env, settings) {
             webSocket.close(1000, 'account expired');
           }
           
-          // Save to KV asynchronously (every ~1MB to avoid excessive writes)
-          if (currentUser.used % 10 < 1) {
-             ctx.waitUntil(updateUserTraffic(env, currentUser.id, currentUser.used));
+          if (accumulatedBytes > 1048576) {
+            ctx.waitUntil(updateUserTraffic(env, currentUser.id, accumulatedBytes));
+            currentUser.used += accumulatedBytes;
+            accumulatedBytes = 0;
           }
         }
         return;
@@ -351,7 +344,6 @@ async function handleVLESSWebSocket(request, env, settings) {
         await writer.write(rawClientData);
         writer.releaseLock();
 
-        // Response header
         const resp = new Uint8Array([vlessVersion[0], 0]);
         webSocket.send(resp);
 
@@ -359,10 +351,13 @@ async function handleVLESSWebSocket(request, env, settings) {
           write(data) { 
             if (!isUserBlocked) {
               webSocket.send(data); 
-              // Count download traffic too
               if (currentUser) {
-                currentUser.used += data.byteLength || data.length || 0;
-                ctx.waitUntil(updateUserTraffic(env, currentUser.id, data.byteLength || data.length || 0));
+                accumulatedBytes += data.byteLength || data.length || 0;
+                if (accumulatedBytes > 1048576) {
+                  ctx.waitUntil(updateUserTraffic(env, currentUser.id, accumulatedBytes));
+                  currentUser.used += accumulatedBytes;
+                  accumulatedBytes = 0;
+                }
               }
             }
           },
@@ -375,18 +370,17 @@ async function handleVLESSWebSocket(request, env, settings) {
     }
   })).catch(() => {});
 
-  // Final traffic save on disconnect
   webSocket.addEventListener('close', async () => {
-    if (currentUser && env.APP_KV) {
-      await updateUserTraffic(env, currentUser.id, 0); // Saves the current accumulated state
+    if (currentUser && env.APP_KV && accumulatedBytes > 0) {
+      await updateUserTraffic(env, currentUser.id, accumulatedBytes);
     }
   });
 
   return new Response(null, { status: 101, webSocket: client });
 }
 
-// ──────────────────────────── Panel HTML ────────────────────────────
-function getPanelHTML(lang, authenticated, usersList = []) {
+// ──────────────────────────── Panel HTML (Pro UI) ────────────────────────────
+function getPanelHTML(lang, authenticated) {
   const isFa = lang !== 'en';
   if (!authenticated) {
     return `<!DOCTYPE html>
@@ -395,29 +389,28 @@ function getPanelHTML(lang, authenticated, usersList = []) {
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>APP Panel Login</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
-:root{--bg:#030303;--green:#00ff88;--glow:rgba(0,255,136,.35);--soft:rgba(0,255,136,.1);--text:#e8ffe8;--muted:#6b8f6b;--border:rgba(0,255,136,.15)}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:Inter,system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;
-background-image:linear-gradient(rgba(0,255,136,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(0,255,136,.02) 1px,transparent 1px);background-size:40px 40px}
-.box{background:#0a0f0a;border:1px solid var(--border);border-radius:14px;padding:2rem;width:100%;max-width:360px;text-align:center}
-h1{color:var(--green);font-size:1.4rem;margin-bottom:.3rem;text-shadow:0 0 14px var(--glow)}
-p{color:var(--muted);font-size:.85rem;margin-bottom:1.2rem}
-input{width:100%;padding:.7rem;background:rgba(0,0,0,.45);border:1px solid var(--border);border-radius:9px;color:var(--text);font-size:.95rem;margin-bottom:.8rem}
-input:focus{outline:none;border-color:var(--green);box-shadow:0 0 0 3px var(--soft)}
-button{width:100%;padding:.7rem;background:var(--green);color:#000;border:none;border-radius:9px;font-weight:700;font-size:.95rem;cursor:pointer}
-button:hover{background:#33ffaa;box-shadow:0 0 14px var(--glow)}
-.err{color:#ff4d6a;font-size:.8rem;margin-top:.5rem;display:none}
+@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700&family=Inter:wght@400;600;700&display=swap');
+:root{--bg:#f8fafc;--card:#ffffff;--text:#1e293b;--muted:#64748b;--primary:#4f46e5;--primary-hover:#4338ca;--border:#e2e8f0;--danger:#ef4444;--success:#10b981}
+*{box-sizing:border-box;margin:0;padding:0;font-family:${isFa?'Vazirmatn':'Inter'},system-ui,sans-serif}
+body{background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center}
+.box{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:2.5rem;width:100%;max-width:380px;text-align:center;box-shadow:0 10px 25px -5px rgba(0,0,0,.05)}
+h1{color:var(--primary);font-size:1.5rem;margin-bottom:.5rem;font-weight:700}
+p{color:var(--muted);font-size:.9rem;margin-bottom:1.5rem}
+input{width:100%;padding:.8rem 1rem;background:#f1f5f9;border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:.95rem;margin-bottom:1rem;transition:.2s}
+input:focus{outline:none;border-color:var(--primary);background:#fff;box-shadow:0 0 0 3px rgba(79,70,229,.1)}
+button{width:100%;padding:.8rem;background:var(--primary);color:#fff;border:none;border-radius:10px;font-weight:600;font-size:.95rem;cursor:pointer;transition:.2s}
+button:hover{background:var(--primary-hover)}
+.err{color:var(--danger);font-size:.8rem;margin-top:.75rem;display:none}
 </style>
 </head>
 <body>
 <div class="box">
   <h1>APP Panel</h1>
-  <p>${isFa ? 'رمز عبور را وارد کنید' : 'Enter password'}</p>
+  <p>${isFa ? 'برای ورود رمز عبور را وارد کنید' : 'Enter your password to login'}</p>
   <form id="f">
     <input type="password" id="pass" placeholder="${isFa ? 'رمز عبور' : 'Password'}" autofocus>
-    <button type="submit">${isFa ? 'ورود' : 'Login'}</button>
-    <div class="err" id="err">${isFa ? 'رمز اشتباه است' : 'Wrong password'}</div>
+    <button type="submit">${isFa ? 'ورود به پنل' : 'Login'}</button>
+    <div class="err" id="err">${isFa ? 'رمز عبور اشتباه است' : 'Wrong password'}</div>
   </form>
 </div>
 <script>
@@ -436,68 +429,72 @@ document.getElementById('f').onsubmit=async e=>{
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>APP Panel</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-:root{--bg:#030303;--card:#0a0f0a;--green:#00ff88;--g2:#00cc6a;--glow:rgba(0,255,136,.35);--soft:rgba(0,255,136,.1);--text:#e8ffe8;--muted:#6b8f6b;--border:rgba(0,255,136,.15);--border2:rgba(0,255,136,.3);--red:#ff4d6a;--yellow:#ffd166;--blue:#4cc9f0}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:Inter,system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;line-height:1.5;
-background-image:linear-gradient(rgba(0,255,136,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(0,255,136,.02) 1px,transparent 1px);background-size:40px 40px}
-.container{max-width:1080px;margin:0 auto;padding:1rem .9rem 3rem}
-.header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem;margin-bottom:1rem;padding-bottom:.7rem;border-bottom:1px solid var(--border)}
-.logo{font-weight:800;font-size:1.15rem;color:var(--green);text-shadow:0 0 12px var(--glow)}
-.nav{display:flex;flex-wrap:wrap;gap:.2rem;margin-bottom:1rem}
-.nav a{padding:.36rem .7rem;border-radius:8px;color:var(--muted);font-size:.78rem;font-weight:500;border:1px solid transparent;cursor:pointer;text-decoration:none}
-.nav a.active,.nav a:hover{color:#000;background:var(--green);box-shadow:0 0 10px var(--glow);font-weight:600}
-.card{background:var(--card);border:1px solid var(--border);border-radius:11px;padding:1rem;margin-bottom:.7rem;position:relative;overflow:hidden}
-.card::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at top right,var(--soft),transparent 50%);pointer-events:none}
-h2{font-size:.88rem;font-weight:700;color:var(--green);margin-bottom:.55rem}
-.muted{color:var(--muted);font-size:.76rem}
-.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:.45rem;margin-bottom:.65rem}
+@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+:root{--bg:#f8fafc;--card:#ffffff;--text:#1e293b;--muted:#64748b;--light:#f1f5f9;--primary:#4f46e5;--primary-hover:#4338ca;--primary-soft:#eef2ff;--border:#e2e8f0;--danger:#ef4444;--danger-soft:#fef2f2;--success:#10b981;--success-soft:#ecfdf5;--yellow:#f59e0b;--yellow-soft:#fffbeb;--blue:#3b82f6;--blue-soft:#eff6ff}
+*{box-sizing:border-box;margin:0;padding:0;font-family:${isFa?'Vazirmatn':'Inter'},system-ui,sans-serif}
+body{background:var(--bg);color:var(--text);min-height:100vh;line-height:1.5}
+.container{max-width:1100px;margin:0 auto;padding:1.5rem 1rem 4rem}
+.header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;margin-bottom:2rem;padding-bottom:1.5rem;border-bottom:1px solid var(--border)}
+.logo{font-weight:700;font-size:1.25rem;color:var(--primary);display:flex;align-items:center;gap:.5rem}
+.logo::before{content:'';width:10px;height:10px;background:var(--primary);border-radius:50%}
+.nav{display:flex;flex-wrap:wrap;gap:.25rem;margin-bottom:1.5rem;background:var(--card);padding:.35rem;border-radius:12px;border:1px solid var(--border);box-shadow:0 1px 3px rgba(0,0,0,.03)}
+.nav a{padding:.5rem 1rem;border-radius:8px;color:var(--muted);font-size:.85rem;font-weight:500;cursor:pointer;text-decoration:none;transition:.2s}
+.nav a.active{color:#fff;background:var(--primary);box-shadow:0 4px 6px -1px rgba(79,70,229,.2)}
+.nav a:not(.active):hover{background:var(--light);color:var(--text)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.5rem;margin-bottom:1rem;box-shadow:0 1px 3px rgba(0,0,0,.03)}
+h2{font-size:1.1rem;font-weight:600;margin-bottom:1rem;color:var(--text)}
+.muted{color:var(--muted);font-size:.8rem}
+.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:.75rem;margin-bottom:.5rem}
 @media(min-width:680px){.stats{grid-template-columns:repeat(4,1fr)}}
-.stat{background:rgba(0,0,0,.4);border:1px solid var(--border);border-radius:9px;padding:.55rem;text-align:center}
-.stat-value{font-size:1.15rem;font-weight:800;color:var(--green)}
-.stat-label{font-size:.64rem;color:var(--muted);margin-top:.08rem}
-.progress-wrap{margin:.35rem 0}.progress-head{display:flex;justify-content:space-between;font-size:.7rem;margin-bottom:.12rem}
-.progress-bar{height:5px;background:rgba(0,255,136,.07);border-radius:99px;overflow:hidden}
-.progress-fill{height:100%;background:linear-gradient(90deg,var(--g2),var(--green));border-radius:99px}
-.config-box{background:rgba(0,0,0,.5);border:1px solid var(--border);border-radius:8px;padding:.65rem;font-family:ui-monospace,monospace;font-size:.68rem;word-break:break-all;position:relative;margin:.4rem 0;color:#b8ffd0}
-button,.btn{display:inline-flex;align-items:center;gap:.2rem;padding:.48rem .8rem;background:var(--green);color:#000;border:none;border-radius:8px;font-size:.78rem;font-weight:700;cursor:pointer;font-family:inherit}
-button:hover{background:#33ffaa;box-shadow:0 0 10px var(--glow)}
-.btn-sm{padding:.25rem .5rem;font-size:.7rem}
-.btn-outline{background:transparent;border:1px solid var(--border2);color:var(--green)}
-.btn-ghost{background:transparent;border:1px solid var(--border);color:var(--muted);padding:.28rem .55rem;font-size:.72rem}
-.btn-danger{background:transparent;border:1px solid rgba(255,77,106,.4);color:var(--red)}
-.btn-blue{background:transparent;border:1px solid rgba(76,201,240,.4);color:var(--blue)}
-.badge{display:inline-block;padding:.08rem .35rem;border-radius:999px;font-size:.62rem;font-weight:600;background:var(--soft);color:var(--green);border:1px solid var(--border);margin:0 .05rem}
-.badge-blue{color:var(--blue);border-color:rgba(76,201,240,.3);background:rgba(76,201,240,.08)}
-.badge-yellow{color:var(--yellow);border-color:rgba(255,209,102,.3);background:rgba(255,209,102,.08)}
-.badge-red{color:var(--red);border-color:rgba(255,77,106,.3);background:rgba(255,77,106,.08)}
-input,textarea,select{width:100%;padding:.5rem .65rem;background:rgba(0,0,0,.45);border:1px solid var(--border);border-radius:7px;color:var(--text);font-size:.8rem;margin-bottom:.4rem;font-family:inherit}
-input:focus,textarea:focus,select:focus{outline:none;border-color:var(--green);box-shadow:0 0 0 3px var(--soft)}
-label.lbl{display:block;margin-bottom:.1rem;font-size:.7rem;color:var(--muted)}
-.grid{display:grid;gap:.5rem}@media(min-width:560px){.grid-2{grid-template-columns:1fr 1fr}}
-.toast{position:fixed;bottom:1rem;left:1rem;background:var(--green);color:#000;padding:.5rem .85rem;border-radius:8px;font-weight:700;font-size:.78rem;opacity:0;transform:translateY(8px);transition:.25s;z-index:90;box-shadow:0 0 16px var(--glow)}
+.stat{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:1rem;text-align:center}
+.stat-value{font-size:1.5rem;font-weight:700;color:var(--primary);margin-bottom:.25rem}
+.stat-label{font-size:.75rem;color:var(--muted);font-weight:500}
+.progress-wrap{margin:.75rem 0}.progress-head{display:flex;justify-content:space-between;font-size:.75rem;margin-bottom:.35rem;color:var(--muted)}
+.progress-bar{height:8px;background:var(--light);border-radius:99px;overflow:hidden}
+.progress-fill{height:100%;background:var(--primary);border-radius:99px;transition:width .3s ease}
+.config-box{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:.75rem;font-family:ui-monospace,monospace;font-size:.75rem;word-break:break-all;position:relative;margin:.5rem 0;color:var(--text)}
+button,.btn{display:inline-flex;align-items:center;gap:.25rem;padding:.5rem 1rem;background:var(--primary);color:#fff;border:none;border-radius:8px;font-size:.8rem;font-weight:500;cursor:pointer;transition:.2s;font-family:inherit}
+button:hover{background:var(--primary-hover)}
+.btn-sm{padding:.35rem .65rem;font-size:.75rem}
+.btn-outline{background:transparent;border:1px solid var(--border);color:var(--text)}
+.btn-outline:hover{background:var(--light);border-color:var(--muted)}
+.btn-ghost{background:transparent;color:var(--muted);padding:.35rem .65rem;font-size:.75rem}
+.btn-ghost:hover{background:var(--light)}
+.btn-danger{background:transparent;border:1px solid var(--danger);color:var(--danger)}
+.btn-danger:hover{background:var(--danger-soft)}
+.btn-blue{background:transparent;border:1px solid var(--blue);color:var(--blue)}
+.btn-blue:hover{background:var(--blue-soft)}
+.badge{display:inline-block;padding:.2rem .5rem;border-radius:6px;font-size:.65rem;font-weight:600;margin:.05rem}
+.badge-default{color:var(--text);background:var(--light)}
+.badge-blue{color:var(--blue);background:var(--blue-soft)}
+.badge-yellow{color:var(--yellow);background:var(--yellow-soft)}
+.badge-red{color:var(--danger);background:var(--danger-soft)}
+.badge-green{color:var(--success);background:var(--success-soft)}
+input,textarea,select{width:100%;padding:.6rem .8rem;background:#fff;border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.85rem;margin-bottom:.5rem;font-family:inherit;transition:.2s}
+input:focus,textarea:focus,select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(79,70,229,.1)}
+label.lbl{display:block;margin-bottom:.25rem;font-size:.75rem;color:var(--muted);font-weight:500}
+.grid{display:grid;gap:.75rem}@media(min-width:560px){.grid-2{grid-template-columns:1fr 1fr}}
+.toast{position:fixed;bottom:1.5rem;left:1.5rem;background:var(--text);color:#fff;padding:.75rem 1.25rem;border-radius:8px;font-weight:500;font-size:.85rem;opacity:0;transform:translateY(10px);transition:.3s;z-index:90;box-shadow:0 10px 15px -3px rgba(0,0,0,.1)}
 .toast.show{opacity:1;transform:translateY(0)}
-.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.8);display:none;align-items:center;justify-content:center;z-index:80;padding:.7rem}
+.modal-bg{position:fixed;inset:0;background:rgba(15,23,42,.6);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;z-index:80;padding:1rem}
 .modal-bg.show{display:flex}
-.modal{background:var(--card);border:1px solid var(--border2);border-radius:12px;padding:1rem;max-width:480px;width:100%;max-height:92vh;overflow-y:auto}
-.modal h3{color:var(--green);margin-bottom:.7rem;font-size:.92rem}
-.check-row{display:flex;align-items:center;gap:.35rem;margin-bottom:.3rem;font-size:.8rem}
-.check-row input{width:auto;margin:0}
-.section-title{font-size:.8rem;font-weight:700;color:var(--green);margin:.7rem 0 .4rem;padding-bottom:.2rem;border-bottom:1px solid var(--border)}
-.field-with-btn{display:flex;gap:.35rem;align-items:flex-start}
+.modal{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:1.5rem;max-width:480px;width:100%;max-height:92vh;overflow-y:auto;box-shadow:0 20px 25px -5px rgba(0,0,0,.1)}
+.modal h3{margin-bottom:1rem;font-size:1.1rem;font-weight:600}
+.check-row{display:flex;align-items:center;gap:.5rem;margin-bottom:.5rem;font-size:.85rem;cursor:pointer}
+.check-row input{width:16px;height:16px;margin:0;accent-color:var(--primary)}
+.section-title{font-size:.85rem;font-weight:600;margin:.75rem 0 .5rem;padding-bottom:.5rem;border-bottom:1px solid var(--border)}
+.field-with-btn{display:flex;gap:.5rem;align-items:flex-start}
 .field-with-btn input,.field-with-btn textarea{flex:1;margin-bottom:0}
-.field-with-btn button{flex-shrink:0}
-.user-card{background:rgba(0,0,0,.35);border:1px solid var(--border);border-radius:9px;padding:.7rem;margin-bottom:.5rem}
-.user-card-head{display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:.35rem;margin-bottom:.35rem}
-.user-meta{font-size:.72rem;color:var(--muted);margin-top:.12rem}
-.brain-row{display:flex;justify-content:space-between;align-items:center;padding:.4rem .5rem;background:rgba(0,0,0,.35);border:1px solid var(--border);border-radius:7px;margin-bottom:.3rem;font-size:.76rem;gap:.35rem;flex-wrap:wrap}
-.latency{font-size:.68rem;font-weight:600;color:var(--green)}
-.client-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:.4rem}
-.client-item{background:rgba(0,0,0,.35);border:1px solid var(--border);border-radius:8px;padding:.5rem;text-align:center;font-size:.72rem}
-.client-item strong{display:block;color:var(--green);margin-bottom:.1rem}
-.client-item a{color:var(--blue);font-size:.68rem;text-decoration:none}
-.info-row{display:flex;justify-content:space-between;padding:.35rem 0;border-bottom:1px solid var(--border);font-size:.78rem}
-.info-label{color:var(--muted)}
+.user-card{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:.75rem}
+.user-card-head{display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:.5rem;margin-bottom:.5rem}
+.user-meta{font-size:.75rem;color:var(--muted);margin-top:.25rem}
+.brain-row{display:flex;justify-content:space-between;align-items:center;padding:.6rem .75rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-bottom:.5rem;font-size:.8rem}
+.latency{font-size:.7rem;font-weight:600;color:var(--success);background:var(--success-soft);padding:.1rem .4rem;border-radius:4px}
+.client-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.75rem}
+.client-item{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:1rem;text-align:center;font-size:.75rem;transition:.2s}
+.client-item:hover{border-color:var(--primary);box-shadow:0 4px 6px -1px rgba(0,0,0,.05)}
+.client-item strong{display:block;color:var(--primary);margin-bottom:.25rem;font-size:.85rem}
+.client-item a{color:var(--blue);font-size:.7rem;text-decoration:none}
 .hidden{display:none!important}
 </style>
 </head>
@@ -505,15 +502,16 @@ label.lbl{display:block;margin-bottom:.1rem;font-size:.7rem;color:var(--muted)}
 <div class="container">
   <div class="header">
     <div class="logo">APP Panel</div>
-    <div>
+    <div style="display:flex;gap:.5rem">
       <button class="btn-ghost btn-sm" onclick="setLang('fa')">FA</button>
       <button class="btn-ghost btn-sm" onclick="setLang('en')">EN</button>
       <button class="btn-ghost btn-sm" onclick="logout()">${isFa ? 'خروج' : 'Logout'}</button>
     </div>
   </div>
+  
   <div class="nav" id="nav">
     <a class="active" data-t="dash">${isFa ? 'داشبورد' : 'Dashboard'}</a>
-    <a data-t="subs">${isFa ? 'ساب‌لینک' : 'Subs'}</a>
+    <a data-t="subs">${isFa ? 'ساب‌لینک‌ها' : 'Subscriptions'}</a>
     <a data-t="users">${isFa ? 'کاربران' : 'Users'}</a>
     <a data-t="warp">Warp</a>
     <a data-t="clients">${isFa ? 'کلاینت‌ها' : 'Clients'}</a>
@@ -521,21 +519,22 @@ label.lbl{display:block;margin-bottom:.1rem;font-size:.7rem;color:var(--muted)}
   </div>
 
   <div id="tab-dash">
-    <div class="card"><h2>${isFa ? 'داشبورد' : 'Dashboard'}</h2>
-      <div class="stats" id="dashStats">
+    <div class="card">
+      <h2>${isFa ? 'نمای کلی' : 'Overview'}</h2>
+      <div class="stats">
         <div class="stat"><div class="stat-value" id="sUsers">0</div><div class="stat-label">${isFa ? 'کاربران' : 'Users'}</div></div>
-        <div class="stat"><div class="stat-value" id="sSubs">0</div><div class="stat-label">${isFa ? 'ساب‌لینک' : 'Subs'}</div></div>
-        <div class="stat"><div class="stat-value" id="sTraffic">0 GB</div><div class="stat-label">${isFa ? 'ترافیک کل' : 'Total Traffic'}</div></div>
-        <div class="stat"><div class="stat-value">ON</div><div class="stat-label">Worker</div></div>
+        <div class="stat"><div class="stat-value" id="sSubs">0</div><div class="stat-label">${isFa ? 'ساب‌لینک‌ها' : 'Subs'}</div></div>
+        <div class="stat"><div class="stat-value" id="sTraffic">0 GB</div><div class="stat-label">${isFa ? 'ترافیک مصرفی' : 'Total Traffic'}</div></div>
+        <div class="stat"><div class="stat-value" style="color:var(--success)">ON</div><div class="stat-label">Worker</div></div>
       </div>
     </div>
   </div>
 
   <div id="tab-subs" class="hidden">
     <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.4rem;margin-bottom:.55rem">
-        <h2 style="margin:0">${isFa ? 'ساب‌لینک‌ها' : 'Subscriptions'}</h2>
-        <button onclick="openSubModal()">${isFa ? '+ ساخت ساب' : '+ New Sub'}</button>
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem;margin-bottom:1rem">
+        <h2 style="margin:0">${isFa ? 'ساب‌سکریپشن‌ها' : 'Subscriptions'}</h2>
+        <button onclick="openSubModal()">+ ${isFa ? 'ساخت ساب' : 'New Sub'}</button>
       </div>
       <div id="subsList"></div>
     </div>
@@ -543,9 +542,9 @@ label.lbl{display:block;margin-bottom:.1rem;font-size:.7rem;color:var(--muted)}
 
   <div id="tab-users" class="hidden">
     <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.4rem;margin-bottom:.55rem">
-        <h2 style="margin:0">${isFa ? 'کاربران' : 'Users'}</h2>
-        <button onclick="openUserModal()">${isFa ? '+ کاربر جدید' : '+ New User'}</button>
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem;margin-bottom:1rem">
+        <h2 style="margin:0">${isFa ? 'مدیریت کاربران' : 'User Management'}</h2>
+        <button onclick="openUserModal()">+ ${isFa ? 'کاربر جدید' : 'New User'}</button>
       </div>
       <div id="usersList"></div>
     </div>
@@ -553,12 +552,12 @@ label.lbl{display:block;margin-bottom:.1rem;font-size:.7rem;color:var(--muted)}
 
   <div id="tab-warp" class="hidden">
     <div class="card">
-      <h2>Warp</h2>
-      <div class="check-row"><input type="checkbox" id="warpOn"><label>${isFa ? 'فعال‌سازی Warp' : 'Enable Warp'}</label></div>
-      <div class="check-row"><input type="checkbox" id="warpPro"><label>Warp Pro</label></div>
+      <h2>Warp Configuration</h2>
+      <div class="check-row"><input type="checkbox" id="warpOn"><label for="warpOn">${isFa ? 'فعال‌سازی Cloudflare Warp' : 'Enable Cloudflare Warp'}</label></div>
+      <div class="check-row"><input type="checkbox" id="warpPro"><label for="warpPro">Warp Pro Endpoint</label></div>
       <label class="lbl">Endpoint</label>
       <input id="warpEndpoint" placeholder="engage.cloudflareclient.com:2408">
-      <button onclick="saveWarp()">${isFa ? 'ذخیره' : 'Save'}</button>
+      <button onclick="saveWarp()" style="margin-top:.5rem">${isFa ? 'ذخیره تغییرات' : 'Save Changes'}</button>
     </div>
   </div>
 
@@ -578,39 +577,41 @@ label.lbl{display:block;margin-bottom:.1rem;font-size:.7rem;color:var(--muted)}
 
   <div id="tab-set" class="hidden">
     <div class="card">
-      <h2>${isFa ? 'تنظیمات' : 'Settings'}</h2>
+      <h2>${isFa ? 'تنظیمات اصلی' : 'General Settings'}</h2>
       <div class="grid grid-2">
         <div><label class="lbl">UUID</label><input id="setUUID" readonly></div>
         <div><label class="lbl">Trojan Password</label><input id="setTrojan"></div>
       </div>
       <label class="lbl">Fingerprint</label>
       <select id="setFP"><option>chrome</option><option>firefox</option><option>randomized</option></select>
-      <div class="section-title">Fragment</div>
+      <div class="section-title">Fragment Settings</div>
       <div class="grid grid-2">
         <div><label class="lbl">Length</label><input id="setFragLen" value="10-20"></div>
         <div><label class="lbl">Interval</label><input id="setFragInt" value="10-20"></div>
       </div>
-      <button onclick="saveSettings()">${isFa ? 'ذخیره' : 'Save'}</button>
-      <button class="btn-outline" onclick="newUUID()">New UUID</button>
+      <div style="display:flex;gap:.5rem;margin-top:.5rem">
+        <button onclick="saveSettings()">${isFa ? 'ذخیره' : 'Save'}</button>
+        <button class="btn-outline" onclick="newUUID()">Generate New UUID</button>
+      </div>
     </div>
     <div class="card">
-      <h2>${isFa ? 'امنیت' : 'Security'}</h2>
-      <label class="lbl">${isFa ? 'رمز جدید پنل' : 'New Panel Password'}</label>
-      <input type="password" id="newPass" placeholder="...">
-      <button onclick="changePass()">${isFa ? 'تغییر رمز' : 'Change Password'}</button>
+      <h2>${isFa ? 'امنیت پنل' : 'Panel Security'}</h2>
+      <label class="lbl">${isFa ? 'رمز عبور جدید پنل' : 'New Panel Password'}</label>
+      <input type="password" id="newPass" placeholder="••••••••">
+      <button onclick="changePass()">${isFa ? 'تغییر رمز عبور' : 'Change Password'}</button>
     </div>
   </div>
 </div>
 
-<!-- Sub Modal -->
+<!-- Modals -->
 <div class="modal-bg" id="modalSub">
   <div class="modal">
-    <h3 id="subModalTitle">${isFa ? 'ساخت ساب' : 'New Sub'}</h3>
+    <h3 id="subModalTitle">${isFa ? 'ساخت ساب جدید' : 'New Subscription'}</h3>
     <input type="hidden" id="subId">
-    <label class="lbl">${isFa ? 'نام' : 'Name'}</label>
+    <label class="lbl">${isFa ? 'نام ساب' : 'Name'}</label>
     <input id="subName" placeholder="main">
     <div class="grid grid-2">
-      <div><label class="lbl">${isFa ? 'حجم GB' : 'Traffic GB'}</label><input type="number" id="subTraffic" value="100"></div>
+      <div><label class="lbl">${isFa ? 'حجم (GB)' : 'Traffic (GB)'}</label><input type="number" id="subTraffic" value="100"></div>
       <div><label class="lbl">${isFa ? 'حداکثر کاربر' : 'Max Users'}</label><input type="number" id="subMaxUsers" value="5"></div>
     </div>
     <div class="grid grid-2">
@@ -622,40 +623,38 @@ label.lbl{display:block;margin-bottom:.1rem;font-size:.7rem;color:var(--muted)}
     <label class="lbl">Path</label>
     <input id="subPath" value="/">
     <div class="section-title">${isFa ? 'پروتکل‌ها' : 'Protocols'}</div>
-    <div class="check-row"><input type="checkbox" id="subVless" checked><label>VLESS</label></div>
-    <div class="check-row"><input type="checkbox" id="subTrojan" checked><label>Trojan</label></div>
-    <div class="section-title">${isFa ? 'پروکسی این ساب' : 'Sub Proxy'}</div>
+    <div class="check-row"><input type="checkbox" id="subVless" checked><label for="subVless">VLESS</label></div>
+    <div class="check-row"><input type="checkbox" id="subTrojan" checked><label for="subTrojan">Trojan</label></div>
+    <div class="section-title">${isFa ? 'تنظیمات پروکسی' : 'Proxy Settings'}</div>
     <label class="lbl">Proxy IP</label>
     <div class="field-with-btn">
       <input id="subProxyIP" placeholder="optional">
       <button type="button" class="btn-outline btn-sm" onclick="openBrain('proxy')">${isFa ? 'مغزن' : 'Brain'}</button>
     </div>
-    <label class="lbl" style="margin-top:.4rem">Clean IPs</label>
+    <label class="lbl" style="margin-top:.5rem">Clean IPs</label>
     <div class="field-with-btn">
       <textarea id="subCleanIPs" rows="2" placeholder="one per line"></textarea>
       <button type="button" class="btn-outline btn-sm" onclick="openBrain('clean')">${isFa ? 'مغزن' : 'Brain'}</button>
     </div>
-    <div class="section-title">${isFa ? 'مسیریابی' : 'Routing'}</div>
-    <div class="check-row"><input type="checkbox" id="subAdblock" checked><label>Ad Block</label></div>
-    <div class="check-row"><input type="checkbox" id="subIran" checked><label>Direct Iran</label></div>
-    <div style="display:flex;gap:.4rem;margin-top:.8rem">
+    <div class="section-title">${isFa ? 'قوانین مسیریابی' : 'Routing Rules'}</div>
+    <div class="check-row"><input type="checkbox" id="subAdblock" checked><label for="subAdblock">Ad Block</label></div>
+    <div class="check-row"><input type="checkbox" id="subIran" checked><label for="subIran">Direct Iran</label></div>
+    <div style="display:flex;gap:.5rem;margin-top:1rem">
       <button onclick="saveSub()">${isFa ? 'ذخیره' : 'Save'}</button>
       <button class="btn-ghost" onclick="closeModal('modalSub')">${isFa ? 'انصراف' : 'Cancel'}</button>
     </div>
   </div>
 </div>
 
-<!-- Brain Modal -->
 <div class="modal-bg" id="modalBrain">
   <div class="modal">
-    <h3 id="brainTitle">${isFa ? 'مغزن' : 'Brain'}</h3>
-    <p class="muted" style="margin-bottom:.5rem">${isFa ? 'انتخاب و افزودن' : 'Select to add'}</p>
+    <h3 id="brainTitle">${isFa ? 'مغزن - انتخاب IP' : 'Brain - Select IP'}</h3>
+    <p class="muted" style="margin-bottom:1rem">${isFa ? 'برای افزودن کلیک کنید' : 'Click to add'}</p>
     <div id="brainList"></div>
-    <button class="btn-ghost" style="width:100%;margin-top:.5rem" onclick="closeModal('modalBrain')">${isFa ? 'بستن' : 'Close'}</button>
+    <button class="btn-ghost" style="width:100%;margin-top:1rem" onclick="closeModal('modalBrain')">${isFa ? 'بستن' : 'Close'}</button>
   </div>
 </div>
 
-<!-- User Modal -->
 <div class="modal-bg" id="modalUser">
   <div class="modal">
     <h3 id="userModalTitle">${isFa ? 'کاربر جدید' : 'New User'}</h3>
@@ -663,7 +662,7 @@ label.lbl{display:block;margin-bottom:.1rem;font-size:.7rem;color:var(--muted)}
     <label class="lbl">${isFa ? 'نام کاربری' : 'Username'}</label>
     <input id="userName">
     <div class="grid grid-2">
-      <div><label class="lbl">${isFa ? 'حجم GB' : 'Traffic GB'}</label><input type="number" id="userTraffic" value="30"></div>
+      <div><label class="lbl">${isFa ? 'حجم (GB)' : 'Traffic (GB)'}</label><input type="number" id="userTraffic" value="30"></div>
       <div><label class="lbl">${isFa ? 'روز انقضا' : 'Days'}</label><input type="number" id="userDays" value="30"></div>
     </div>
     <label class="lbl">${isFa ? 'حداکثر دستگاه' : 'Max Devices'}</label>
@@ -672,7 +671,7 @@ label.lbl{display:block;margin-bottom:.1rem;font-size:.7rem;color:var(--muted)}
     <select id="userSub"></select>
     <label class="lbl">${isFa ? 'یادداشت' : 'Note'}</label>
     <input id="userNote">
-    <div style="display:flex;gap:.4rem;margin-top:.7rem">
+    <div style="display:flex;gap:.5rem;margin-top:1rem">
       <button onclick="saveUser()">${isFa ? 'ذخیره' : 'Save'}</button>
       <button class="btn-ghost" onclick="closeModal('modalUser')">${isFa ? 'انصراف' : 'Cancel'}</button>
     </div>
@@ -680,6 +679,7 @@ label.lbl{display:block;margin-bottom:.1rem;font-size:.7rem;color:var(--muted)}
 </div>
 
 <div id="toast" class="toast"></div>
+
 <script>
 const isFa = ${isFa ? 'true' : 'false'};
 let settings = {}, subs = [], users = [];
@@ -693,7 +693,7 @@ const BRAIN_IPS = [
   {ip:'cloudflare.com', ms:78}
 ];
 
-function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200)}
+function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2000)}
 function openModal(id){document.getElementById(id).classList.add('show')}
 function closeModal(id){document.getElementById(id).classList.remove('show')}
 function setLang(l){location.href='/panel?lang='+l}
@@ -733,32 +733,29 @@ function render(){
   document.getElementById('warpPro').checked = !!(settings.warp&&settings.warp.pro);
   document.getElementById('warpEndpoint').value = (settings.warp&&settings.warp.endpoint)||'';
 
-  // Subs list
   const sl = document.getElementById('subsList');
-  if(!subs.length){sl.innerHTML='<p class="muted">'+(isFa?'هنوز سابی ساخته نشده':'No subs yet')+'</p>'}
+  if(!subs.length){sl.innerHTML='<p class="muted">'+(isFa?'هیچ سابی ساخته نشده':'No subs created yet')+'</p>'}
   else{
     sl.innerHTML = subs.map(s=>{
       const link = location.origin+'/sub/'+s.id;
       const badges = [];
-      if(s.protocols?.vless!==false) badges.push('<span class="badge">VLESS</span>');
-      if(s.protocols?.trojan) badges.push('<span class="badge">Trojan</span>');
+      if(s.protocols?.vless!==false) badges.push('<span class="badge badge-default">VLESS</span>');
+      if(s.protocols?.trojan) badges.push('<span class="badge badge-default">Trojan</span>');
       if(s.routing?.adblock) badges.push('<span class="badge badge-blue">AdBlock</span>');
-      if(s.routing?.iran) badges.push('<span class="badge badge-blue">Iran</span>');
-      return '<div class="card" style="background:rgba(0,0,0,.35);margin-bottom:.5rem">'+
-        '<div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:.3rem">'+
-        '<div><strong>'+esc(s.name)+'</strong><div style="margin-top:.2rem">'+badges.join('')+'</div></div>'+
-        '<div style="display:flex;gap:.25rem">'+
-        '<button class="btn-outline btn-sm" onclick="copyText(\\''+link+'\\')">Copy</button>'+
+      if(s.routing?.iran) badges.push('<span class="badge badge-yellow">Iran</span>');
+      return '<div class="user-card">'+
+        '<div class="user-card-head"><div><strong>'+esc(s.name)+'</strong><div style="margin-top:.25rem">'+badges.join('')+'</div></div>'+
+        '<div style="display:flex;gap:.35rem">'+
+        '<button class="btn-outline btn-sm" onclick="copyText(\\''+link+'\\')">'+(isFa?'کپی':'Copy')+'</button>'+
         '<button class="btn-outline btn-sm" onclick="editSub(\\''+s.id+'\\')">'+(isFa?'ویرایش':'Edit')+'</button>'+
         '<button class="btn-danger btn-sm" onclick="delSub(\\''+s.id+'\\')">'+(isFa?'حذف':'Del')+'</button></div></div>'+
-        '<div class="config-box" style="margin-top:.4rem">'+link+'</div>'+
-        '<div class="muted" style="font-size:.68rem">Port '+(s.port||443)+' · Proxy: '+(s.proxyIP||'-')+' · Clean: '+((s.cleanIPs||[]).length)+'</div></div>';
+        '<div class="config-box">'+link+'</div>'+
+        '<div class="muted" style="margin-top:.35rem">Port '+(s.port||443)+' · Proxy: '+(s.proxyIP||'Default')+' · Clean IPs: '+((s.cleanIPs||[]).length)+'</div></div>';
     }).join('');
   }
 
-  // Users list
   const ul = document.getElementById('usersList');
-  if(!users.length){ul.innerHTML='<p class="muted">'+(isFa?'کاربری نیست':'No users')+'</p>'}
+  if(!users.length){ul.innerHTML='<p class="muted">'+(isFa?'هیچ کاربری وجود ندارد':'No users found')+'</p>'}
   else{
     ul.innerHTML = users.map(u=>{
       const used = (u.used / 1024 / 1024 / 1024).toFixed(2);
@@ -766,33 +763,32 @@ function render(){
       const pct = total>0 ? Math.min(100, Math.round(used/total*100)) : 0;
       const isExpired = u.expire && new Date(u.expire) < new Date();
       const isLimited = total>0 && u.used >= total * 1024 * 1024 * 1024;
-      const statusBadge = isExpired || isLimited ? '<span class="badge badge-red">'+(isFa?'منقضی/تمام':'Expired')+'</span>' : '<span class="badge">'+(isFa?'فعال':'Active')+'</span>';
+      const statusBadge = isExpired || isLimited ? '<span class="badge badge-red">'+(isFa?'مسدود':'Blocked')+'</span>' : '<span class="badge badge-green">'+(isFa?'فعال':'Active')+'</span>';
       
       return '<div class="user-card">'+
         '<div class="user-card-head"><div><strong>'+esc(u.name)+'</strong> '+statusBadge+
         (u.note?'<div class="user-meta">'+esc(u.note)+'</div>':'')+'</div>'+
-        '<div style="display:flex;gap:.25rem;flex-wrap:wrap">'+
-        '<button class="btn-outline btn-sm" onclick="copyText(\\''+location.origin+'/sub/'+u.id+'\\')">Copy Sub</button>'+
+        '<div style="display:flex;gap:.35rem;flex-wrap:wrap">'+
+        '<button class="btn-outline btn-sm" onclick="copyText(\\''+location.origin+'/sub/'+u.id+'\\')">Sub Link</button>'+
         '<button class="btn-outline btn-sm" onclick="editUser(\\''+u.id+'\\')">'+(isFa?'ویرایش':'Edit')+'</button>'+
         '<button class="btn-blue btn-sm" onclick="resetUser(\\''+u.id+'\\')">'+(isFa?'ریست':'Reset')+'</button>'+
         '<button class="btn-danger btn-sm" onclick="delUser(\\''+u.id+'\\')">'+(isFa?'حذف':'Del')+'</button></div></div>'+
-        '<div class="progress-wrap"><div class="progress-head"><span>'+(isFa?'ترافیک':'Traffic')+'</span><span>'+used+' / '+(total||'∞')+' GB</span></div>'+
+        '<div class="progress-wrap"><div class="progress-head"><span>'+(isFa?'مصرف ترافیک':'Traffic Usage')+'</span><span>'+used+' / '+(total||'∞')+' GB</span></div>'+
         '<div class="progress-bar"><div class="progress-fill" style="width:'+pct+'%"></div></div></div>'+
-        '<div class="muted" style="font-size:.7rem;margin-top:.2rem">'+(isFa?'دستگاه':'Devices')+': '+(u.devices||0)+'/'+(u.maxDevices||'∞')+' · '+(isFa?'انقضا':'Exp')+': '+(u.expire||'-')+'</div></div>';
+        '<div class="muted" style="font-size:.75rem;margin-top:.5rem">'+(isFa?'دستگاه‌ها':'Devices')+': '+(u.devices||0)+'/'+(u.maxDevices||'∞')+' · '+(isFa?'انقضا':'Expire')+': '+(u.expire||'-')+'</div></div>';
     }).join('');
   }
 
-  // user sub select
   const sel = document.getElementById('userSub');
   sel.innerHTML = '<option value="">'+(isFa?'همه':'All')+'</option>' + subs.map(s=>'<option value="'+s.id+'">'+esc(s.name)+'</option>').join('');
 }
 
 function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function copyText(t){navigator.clipboard.writeText(t).then(()=>toast(isFa?'کپی شد':'Copied'))}
+function copyText(t){navigator.clipboard.writeText(t).then(()=>toast(isFa?'کپی شد':'Copied to clipboard'))}
 
 function openSubModal(id){
   document.getElementById('subId').value = id||'';
-  document.getElementById('subModalTitle').textContent = id ? (isFa?'ویرایش ساب':'Edit Sub') : (isFa?'ساخت ساب':'New Sub');
+  document.getElementById('subModalTitle').textContent = id ? (isFa?'ویرایش ساب':'Edit Sub') : (isFa?'ساخت ساب جدید':'New Sub');
   if(id){
     const s = subs.find(x=>x.id===id);
     if(s){
@@ -834,11 +830,11 @@ async function saveSub(){
     routing: {adblock: document.getElementById('subAdblock').checked, iran: document.getElementById('subIran').checked}
   };
   const r = await fetch('/api/subs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(r.ok){closeModal('modalSub');toast(isFa?'ذخیره شد':'Saved');loadAll()}
-  else toast('Error');
+  if(r.ok){closeModal('modalSub');toast(isFa?'با موفقیت ذخیره شد':'Saved successfully');loadAll()}
+  else toast('Error occurred');
 }
 async function delSub(id){
-  if(!confirm(isFa?'حذف شود؟':'Delete?'))return;
+  if(!confirm(isFa?'آیا از حذف مطمئن هستید؟':'Are you sure?'))return;
   await fetch('/api/subs?id='+id,{method:'DELETE'});
   toast(isFa?'حذف شد':'Deleted');loadAll();
 }
@@ -847,7 +843,7 @@ function openBrain(mode){
   brainMode = mode;
   document.getElementById('brainTitle').textContent = (isFa?'مغزن':'Brain')+' — '+(mode==='proxy'?'Proxy IP':'Clean IP');
   document.getElementById('brainList').innerHTML = BRAIN_IPS.map(b=>
-    '<div class="brain-row"><div><strong>'+b.ip+'</strong></div><div style="display:flex;align-items:center;gap:.3rem"><span class="latency">'+b.ms+'ms</span>'+
+    '<div class="brain-row"><div><strong>'+b.ip+'</strong></div><div style="display:flex;align-items:center;gap:.5rem"><span class="latency">'+b.ms+' ms</span>'+
     '<button class="btn-sm" onclick="pickBrain(\\''+b.ip+'\\')">'+(isFa?'افزودن':'Add')+'</button></div></div>'
   ).join('');
   openModal('modalBrain');
@@ -862,7 +858,7 @@ function pickBrain(ip){
     if(!lines.includes(ip)) lines.push(ip);
     ta.value=lines.join('\\n');
   }
-  toast(ip);
+  toast(ip + ' added');
 }
 
 function openUserModal(id){
@@ -899,17 +895,17 @@ async function saveUser(){
     enabled:true
   };
   const r=await fetch('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(r.ok){closeModal('modalUser');toast(isFa?'ذخیره شد':'Saved');loadAll()}
+  if(r.ok){closeModal('modalUser');toast(isFa?'کاربر ذخیره شد':'User saved');loadAll()}
   else toast('Error');
 }
 async function delUser(id){
-  if(!confirm(isFa?'حذف شود؟':'Delete?'))return;
+  if(!confirm(isFa?'حذف کاربر؟':'Delete user?'))return;
   await fetch('/api/users?id='+id,{method:'DELETE'});
   toast(isFa?'حذف شد':'Deleted');loadAll();
 }
 async function resetUser(id){
   await fetch('/api/users/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
-  toast(isFa?'ریست شد':'Reset');loadAll();
+  toast(isFa?'ترافیک ریست شد':'Traffic reset');loadAll();
 }
 
 async function saveSettings(){
@@ -919,15 +915,15 @@ async function saveSettings(){
     fragment:{length:document.getElementById('setFragLen').value,interval:document.getElementById('setFragInt').value,packets:'tlshello'}
   };
   await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  toast(isFa?'ذخیره شد':'Saved');loadAll();
+  toast(isFa?'تنظیمات ذخیره شد':'Settings saved');loadAll();
 }
 async function newUUID(){
   await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({newUUID:true})});
-  toast('New UUID');loadAll();
+  toast('New UUID generated');loadAll();
 }
 async function changePass(){
   const p=document.getElementById('newPass').value;
-  if(!p||p.length<4){toast('Min 4 chars');return}
+  if(!p||p.length<4){toast(isFa?'حداقل ۴ کاراکتر':'Min 4 chars');return}
   await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p})});
   toast(isFa?'رمز تغییر کرد':'Password changed');
   document.getElementById('newPass').value='';
@@ -1068,7 +1064,7 @@ async function handleAPI(request, env, path) {
   return json({ error: 'not found' }, 404);
 }
 
-// ──────────────────────────── Main ────────────────────────────
+// ──────────────────────────── Main Export ────────────────────────────
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -1089,8 +1085,6 @@ export default {
       const upgrade = request.headers.get('Upgrade') || '';
       if (upgrade.toLowerCase() === 'websocket') {
         const settings = await getSettings(env);
-        
-        // Extract User ID from path if present (VLESS connects to /sub/{userId})
         const pathParts = path.split('/');
         let currentUser = null;
         
@@ -1099,7 +1093,6 @@ export default {
           const users = await getUsers(env);
           currentUser = users.find(u => u.id === userId);
           
-          // Check Expiry and Traffic Limit
           if (currentUser) {
             if (currentUser.expire && new Date(currentUser.expire) < new Date()) {
               return new Response('Account Expired', { status: 403 });
@@ -1110,7 +1103,6 @@ export default {
           }
         }
         
-        // Attach currentUser to handleVLESSWebSocket via closure
         return handleVLESSWebSocket(request, env, settings, currentUser, ctx);
       }
 
@@ -1118,23 +1110,17 @@ export default {
         return await handleAPI(request, env, path);
       }
 
-      // Subscriptions
       if (path.startsWith(SUB_PATH + '/')) {
         const id = path.slice(SUB_PATH.length + 1).split('/')[0];
         const settings = await getSettings(env);
         const users = await getUsers(env);
         const subs = await getSubs(env);
         
-        // Check if it's a user sub
         const user = users.find(u => u.id === id);
         if (user) {
-          // Find linked sub or use default
           const sub = user.subId ? subs.find(s => s.id === user.subId) : subs[0] || { name: 'APP', port: 443, path: '/', protocols: { vless: true, trojan: true } };
-          
           const usedBytes = user.used || 0;
           const totalBytes = user.traffic > 0 ? user.traffic * 1024 * 1024 * 1024 : 0;
-          const remainBytes = totalBytes > 0 ? totalBytes - usedBytes : 0;
-          
           const expireTime = user.expire ? Math.floor(new Date(user.expire).getTime() / 1000) : 0;
           
           return new Response(generateUserSubContent(user, sub, settings, host), {
@@ -1146,7 +1132,6 @@ export default {
           });
         }
         
-        // Check if it's a general sub
         const sub = subs.find(s => s.id === id);
         if (sub) {
           return new Response(generateSubContent(sub, settings, host), {
@@ -1154,7 +1139,6 @@ export default {
           });
         }
         
-        // Fallback global sub
         const fakeSub = { name: 'APP', port: 443, path: '/', protocols: { vless: true, trojan: true }, proxyIP: settings.proxyIP, cleanIPs: settings.cleanIPs };
         return new Response(generateSubContent(fakeSub, settings, host), {
           headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Profile-Update-Interval': '6' }
@@ -1193,15 +1177,7 @@ export default {
       return new Response('Error: ' + (err.message || String(err)), { status: 500 });
     }
   }
-};
-
-// Modified VLESS Handler to support Real Traffic Counting
-async function handleVLESSWebSocket(request, env, settings, currentUser, ctx) {
-  const webSocketPair = new WebSocketPair();
-  const [client, webSocket] = Object.values(webSocketPair);
-  webSocket.accept();
-
-  let remoteSocket = { value: null };
+}; { value: null };
   const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
   const { data: earlyData } = base64ToArrayBuffer(earlyDataHeader);
   const readable = makeReadableWebSocketStream(webSocket, earlyData);
