@@ -3,18 +3,21 @@
  *   APP Panel  ·  Advanced Proxy Panel  v1.1
  *   پنل پروکسی پیشرفته — نسخه واقعی
  * ═══════════════════════════════════════════════════════════════
- *  Default Password: 123456
+ *  Default Password: sfdns990 (change it after first login!)
  *  Works on Cloudflare Workers + Pages
  *  Requires KV binding: APP_KV
  */
 
 import { connect } from 'cloudflare:sockets';
 
-const DEFAULT_PASSWORD = '123456';
+const DEFAULT_PASSWORD = 'sfdns990';
 const PANEL_PATH = '/panel';
 const SUB_PATH = '/sub';
 const DOH_PATH = '/doh';
 const API_PATH = '/api';
+const SESSION_TTL = 86400 * 7; // 7 days
+const LOGIN_MAX_ATTEMPTS = 5;
+const LOGIN_LOCK_SECONDS = 300; // 5 minutes
 
 // ──────────────────────────── Utils ────────────────────────────
 function uuid() {
@@ -23,6 +26,12 @@ function uuid() {
 
 function isValidUUID(u) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(u);
+}
+
+function randomToken(len = 16) {
+  const bytes = new Uint8Array(len);
+  crypto.getRandomValues(bytes);
+  return [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 function base64ToArrayBuffer(base64Str) {
@@ -35,6 +44,113 @@ function base64ToArrayBuffer(base64Str) {
     return { data: bytes.buffer };
   } catch (e) {
     return { error: e };
+  }
+}
+
+function bytesToHex(bytes) {
+  return [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function base64UrlEncode(strOrBytes) {
+  let bytes;
+  if (typeof strOrBytes === 'string') bytes = new TextEncoder().encode(strOrBytes);
+  else bytes = new Uint8Array(strOrBytes);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64UrlDecodeToString(b64url) {
+  let b64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
+  while (b64.length % 4) b64 += '=';
+  return atob(b64);
+}
+
+// Constant-time string comparison (mitigates timing attacks on password checks)
+function safeEqual(a, b) {
+  a = String(a || '');
+  b = String(b || '');
+  const len = Math.max(a.length, b.length, 1);
+  let diff = a.length === b.length ? 0 : 1;
+  for (let i = 0; i < len; i++) {
+    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  }
+  return diff === 0;
+}
+
+// ──────────────────────────── SHA-224 (needed for Trojan handshake hash) ────────────────────────────
+// Pure JS SHA-224 (FIPS 180-4). Web Crypto's subtle.digest does not support SHA-224.
+function sha224Hex(message) {
+  const K = [
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+  ];
+  let h = [0xc1059ed8,0x367cd507,0x3070dd17,0xf70e5939,0xffc00b31,0x68581511,0x64f98fa7,0xbefa4fa4];
+  const bytes = new TextEncoder().encode(message);
+  const bitLen = bytes.length * 8;
+  const padLen = (((bytes.length + 8) >> 6) + 1) << 6;
+  const padded = new Uint8Array(padLen);
+  padded.set(bytes);
+  padded[bytes.length] = 0x80;
+  const dv = new DataView(padded.buffer);
+  dv.setUint32(padLen - 4, bitLen >>> 0, false);
+  dv.setUint32(padLen - 8, Math.floor(bitLen / 0x100000000), false);
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+  for (let offset = 0; offset < padLen; offset += 64) {
+    const w = new Array(64);
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(offset + i * 4, false);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i-15],7) ^ rotr(w[i-15],18) ^ (w[i-15] >>> 3);
+      const s1 = rotr(w[i-2],17) ^ rotr(w[i-2],19) ^ (w[i-2] >>> 10);
+      w[i] = (w[i-16] + s0 + w[i-7] + s1) | 0;
+    }
+    let [a,b,c,d,e,f,g,hh] = h;
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e,6) ^ rotr(e,11) ^ rotr(e,25);
+      const ch = (e & f) ^ ((~e) & g);
+      const temp1 = (hh + S1 + ch + K[i] + w[i]) | 0;
+      const S0 = rotr(a,2) ^ rotr(a,13) ^ rotr(a,22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const temp2 = (S0 + maj) | 0;
+      hh = g; g = f; f = e; e = (d + temp1) | 0;
+      d = c; c = b; b = a; a = (temp1 + temp2) | 0;
+    }
+    h[0]=(h[0]+a)|0; h[1]=(h[1]+b)|0; h[2]=(h[2]+c)|0; h[3]=(h[3]+d)|0;
+    h[4]=(h[4]+e)|0; h[5]=(h[5]+f)|0; h[6]=(h[6]+g)|0; h[7]=(h[7]+hh)|0;
+  }
+  return h.slice(0,7).map(x => (x>>>0).toString(16).padStart(8,'0')).join('');
+}
+
+// ──────────────────────────── HMAC session tokens (stateless, KV-independent) ────────────────────────────
+async function hmacKey(secret) {
+  return crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+}
+
+async function signToken(secret, payloadObj) {
+  const payload = base64UrlEncode(JSON.stringify(payloadObj));
+  const key = await hmacKey(secret);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payload));
+  return payload + '.' + base64UrlEncode(sig);
+}
+
+async function verifyToken(secret, token) {
+  if (!token || token.indexOf('.') === -1) return null;
+  const [payload, sig] = token.split('.');
+  try {
+    const key = await hmacKey(secret);
+    const expected = base64UrlEncode(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payload)));
+    if (!safeEqual(expected, sig)) return null;
+    const data = JSON.parse(base64UrlDecodeToString(payload));
+    if (!data.exp || Date.now() / 1000 > data.exp) return null;
+    return data;
+  } catch (e) {
+    return null;
   }
 }
 
@@ -59,6 +175,7 @@ function redirect(url) {
 function defaultSettings() {
   return {
     password: DEFAULT_PASSWORD,
+    secret: randomToken(32), // used to sign session tokens (HMAC)
     uuid: uuid(),
     trojanPassword: 'trojan' + Math.random().toString(36).slice(2, 10),
     fingerprint: 'chrome',
@@ -77,68 +194,131 @@ function defaultUsers() {
   return [];
 }
 
+// ──────────────────────────── In-memory fallback (used only when APP_KV is not bound) ────────────────────────────
+// Without KV, Worker state can't survive across isolates/deploys — this at least keeps
+// settings/subs/users/usage stable for the lifetime of a single running isolate instead of
+// regenerating (e.g. a new random UUID) on every request, which was a functional bug before.
+// A KV binding is strongly recommended for real deployments — see README.
+const MEM = {
+  settings: null,
+  subs: null,
+  users: null,
+  loginAttempts: new Map() // ip -> { count, until }
+};
+
 // ──────────────────────────── KV Helpers ────────────────────────────
 async function getSettings(env) {
-  if (!env.APP_KV) return defaultSettings();
+  if (!env.APP_KV) {
+    if (!MEM.settings) MEM.settings = defaultSettings();
+    return MEM.settings;
+  }
   const raw = await env.APP_KV.get('settings', 'json');
-  return raw ? { ...defaultSettings(), ...raw } : defaultSettings();
+  if (raw) return { ...defaultSettings(), ...raw, secret: raw.secret || (await ensurePersistedSecret(env, raw)) };
+  const fresh = defaultSettings();
+  await env.APP_KV.put('settings', JSON.stringify(fresh));
+  return fresh;
+}
+
+async function ensurePersistedSecret(env, raw) {
+  const secret = randomToken(32);
+  await env.APP_KV.put('settings', JSON.stringify({ ...raw, secret }));
+  return secret;
 }
 
 async function saveSettings(env, data) {
-  if (!env.APP_KV) return;
+  if (!env.APP_KV) { MEM.settings = data; return; }
   await env.APP_KV.put('settings', JSON.stringify(data));
 }
 
 async function getSubs(env) {
-  if (!env.APP_KV) return defaultSubs();
+  if (!env.APP_KV) return (MEM.subs = MEM.subs || defaultSubs());
   const raw = await env.APP_KV.get('subs', 'json');
   return raw || defaultSubs();
 }
 
 async function saveSubs(env, data) {
-  if (!env.APP_KV) return;
+  if (!env.APP_KV) { MEM.subs = data; return; }
   await env.APP_KV.put('subs', JSON.stringify(data));
 }
 
 async function getUsers(env) {
-  if (!env.APP_KV) return defaultUsers();
+  if (!env.APP_KV) return (MEM.users = MEM.users || defaultUsers());
   const raw = await env.APP_KV.get('users', 'json');
   return raw || defaultUsers();
 }
 
 async function saveUsers(env, data) {
-  if (!env.APP_KV) return;
+  if (!env.APP_KV) { MEM.users = data; return; }
   await env.APP_KV.put('users', JSON.stringify(data));
 }
 
 // ──────────────────────────── Auth ────────────────────────────
-async function checkAuth(request, env) {
+function getCookieToken(request) {
   const cookie = request.headers.get('Cookie') || '';
   const match = cookie.match(/app_token=([^;]+)/);
-  if (!match) return false;
-  const token = match[1];
-  // Without KV: accept any non-empty token (session is cookie-only)
-  if (!env.APP_KV) return token.length > 8;
-  const session = await env.APP_KV.get('session:' + token);
-  return !!session;
+  return match ? match[1] : null;
 }
 
-async function createSession(env) {
-  const token = crypto.randomUUID().replace(/-/g, '');
+// Real, stateless, signed-session auth — works identically with or without KV,
+// and can no longer be bypassed with an arbitrary >8 char cookie value.
+async function checkAuth(request, env, settingsIn) {
+  const token = getCookieToken(request);
+  if (!token) return false;
+  const settings = settingsIn || await getSettings(env);
+  const data = await verifyToken(settings.secret, token);
+  return !!data;
+}
+
+async function createSession(env, settingsIn) {
+  const settings = settingsIn || await getSettings(env);
+  const exp = Math.floor(Date.now() / 1000) + SESSION_TTL;
+  return signToken(settings.secret, { exp });
+}
+
+// ──────────────────────────── Login rate limiting ────────────────────────────
+function clientIP(request) {
+  return request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || 'unknown';
+}
+
+async function isLoginLocked(request, env) {
+  const ip = clientIP(request);
+  const now = Math.floor(Date.now() / 1000);
   if (env.APP_KV) {
-    await env.APP_KV.put('session:' + token, '1', { expirationTtl: 86400 * 7 });
+    const raw = await env.APP_KV.get('loginfail:' + ip, 'json');
+    return !!(raw && raw.count >= LOGIN_MAX_ATTEMPTS && raw.until > now);
   }
-  return token;
+  const rec = MEM.loginAttempts.get(ip);
+  return !!(rec && rec.count >= LOGIN_MAX_ATTEMPTS && rec.until > now);
+}
+
+async function recordLoginFailure(request, env) {
+  const ip = clientIP(request);
+  const now = Math.floor(Date.now() / 1000);
+  if (env.APP_KV) {
+    const raw = (await env.APP_KV.get('loginfail:' + ip, 'json')) || { count: 0, until: 0 };
+    const count = raw.until > now ? raw.count + 1 : 1;
+    await env.APP_KV.put('loginfail:' + ip, JSON.stringify({ count, until: now + LOGIN_LOCK_SECONDS }), { expirationTtl: LOGIN_LOCK_SECONDS });
+    return;
+  }
+  const rec = MEM.loginAttempts.get(ip);
+  const count = rec && rec.until > now ? rec.count + 1 : 1;
+  MEM.loginAttempts.set(ip, { count, until: now + LOGIN_LOCK_SECONDS });
+}
+
+async function clearLoginFailures(request, env) {
+  const ip = clientIP(request);
+  if (env.APP_KV) { await env.APP_KV.delete('loginfail:' + ip); return; }
+  MEM.loginAttempts.delete(ip);
 }
 
 // ──────────────────────────── Subscription Generator ────────────────────────────
-function generateVlessLink(host, uuid, port, path, remark, proxyIP) {
+function generateVlessLink(host, uuid, port, path, remark, proxyIP, fp) {
   const address = proxyIP || host;
   const params = new URLSearchParams({
     encryption: 'none',
     security: 'tls',
     sni: host,
-    fp: 'chrome',
+    fp: fp || 'chrome',
     type: 'ws',
     host: host,
     path: path || '/'
@@ -146,12 +326,12 @@ function generateVlessLink(host, uuid, port, path, remark, proxyIP) {
   return `vless://${uuid}@${address}:${port}?${params.toString()}#${encodeURIComponent(remark || 'APP')}`;
 }
 
-function generateTrojanLink(host, password, port, path, remark, proxyIP) {
+function generateTrojanLink(host, password, port, path, remark, proxyIP, fp) {
   const address = proxyIP || host;
   const params = new URLSearchParams({
     security: 'tls',
     sni: host,
-    fp: 'chrome',
+    fp: fp || 'chrome',
     type: 'ws',
     host: host,
     path: path || '/'
@@ -159,37 +339,42 @@ function generateTrojanLink(host, password, port, path, remark, proxyIP) {
   return `trojan://${password}@${address}:${port}?${params.toString()}#${encodeURIComponent(remark || 'APP-Trojan')}`;
 }
 
-function generateSubContent(sub, settings, host) {
+// credUUID/credTrojan let callers generate a link for a specific user's own credentials
+// instead of always the global admin ones — this is what makes per-user access real.
+function generateSubContent(sub, settings, host, credUUID, credTrojan) {
   const links = [];
   const port = sub.port || 443;
   const path = sub.path || '/';
   const remark = sub.name || 'APP';
   const proxyIP = sub.proxyIP || settings.proxyIP || '';
   const cleanIPs = (sub.cleanIPs || settings.cleanIPs || []).filter(Boolean);
+  const fp = settings.fingerprint || 'chrome';
+  const vlessUUID = credUUID || settings.uuid;
+  const trojanPass = credTrojan || settings.trojanPassword;
 
   if (sub.protocols?.vless !== false) {
-    links.push(generateVlessLink(host, settings.uuid, port, path, remark, proxyIP));
+    links.push(generateVlessLink(host, vlessUUID, port, path, remark, proxyIP, fp));
     for (const ip of cleanIPs) {
-      links.push(generateVlessLink(host, settings.uuid, port, path, remark + '-' + ip, ip));
+      links.push(generateVlessLink(host, vlessUUID, port, path, remark + '-' + ip, ip, fp));
     }
   }
   if (sub.protocols?.trojan) {
-    links.push(generateTrojanLink(host, settings.trojanPassword, port, path, remark + '-Trojan', proxyIP));
+    links.push(generateTrojanLink(host, trojanPass, port, path, remark + '-Trojan', proxyIP, fp));
   }
   return btoa(links.join('\n'));
 }
 
 // ──────────────────────────── VLESS Handler (core) ────────────────────────────
-function processVlessHeader(buffer, expectedUUID) {
+// No longer takes an expectedUUID — it just extracts the UUID from the header.
+// The caller matches that UUID against the admin + all per-user UUIDs, so every
+// user's own credentials actually work (previously only the single global UUID did).
+function processVlessHeader(buffer) {
   if (buffer.byteLength < 24) return { hasError: true, message: 'invalid header' };
   const view = new DataView(buffer);
   const version = new Uint8Array(buffer.slice(0, 1))[0];
   const uuidBytes = new Uint8Array(buffer.slice(1, 17));
   const uuidStr = [...uuidBytes].map(b => b.toString(16).padStart(2, '0')).join('')
     .replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5');
-  if (uuidStr.toLowerCase() !== expectedUUID.toLowerCase()) {
-    return { hasError: true, message: 'invalid uuid' };
-  }
   const optLen = new Uint8Array(buffer.slice(17, 18))[0];
   const cmd = new Uint8Array(buffer.slice(18 + optLen, 19 + optLen))[0];
   const isUDP = cmd === 2;
@@ -215,7 +400,9 @@ function processVlessHeader(buffer, expectedUUID) {
       addressLength = 16;
       const ipv6 = [];
       const dv = new DataView(buffer.slice(addressIndex, addressIndex + 16));
-      for (let i = 0; i < 8; i++) ipv6.push(dv.getUint16(i * 2).toString(16));
+      // Each group must be zero-padded to 4 hex digits, or the address is malformed
+      // (e.g. "1" instead of "0001") — this was a bug in the original parser.
+      for (let i = 0; i < 8; i++) ipv6.push(dv.getUint16(i * 2).toString(16).padStart(4, '0'));
       addressRemote = ipv6.join(':');
       break;
     default:
@@ -224,6 +411,7 @@ function processVlessHeader(buffer, expectedUUID) {
   const rawDataIndex = addressIndex + addressLength;
   return {
     hasError: false,
+    uuidStr,
     addressRemote,
     portRemote,
     rawDataIndex,
@@ -232,12 +420,67 @@ function processVlessHeader(buffer, expectedUUID) {
   };
 }
 
+// ──────────────────────────── Trojan Handler (core) ────────────────────────────
+// Trojan-over-WebSocket header: hex(SHA224(password)) [56 chars] + CRLF + CMD(1) ATYP(1) ADDR PORT(2, BE) + CRLF + payload
+// This was previously never implemented — links were generated but any real Trojan
+// client would get rejected by the VLESS parser. This makes Trojan actually work.
+function looksLikeTrojan(bytes) {
+  if (bytes.length < 58) return false;
+  for (let i = 0; i < 56; i++) {
+    const c = bytes[i];
+    const isHex = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
+    if (!isHex) return false;
+  }
+  return bytes[56] === 0x0d && bytes[57] === 0x0a; // \r\n
+}
+
+function processTrojanHeader(buffer) {
+  const bytes = new Uint8Array(buffer);
+  if (!looksLikeTrojan(bytes)) return { hasError: true, message: 'invalid trojan header' };
+  const hashHex = new TextDecoder().decode(bytes.slice(0, 56)).toLowerCase();
+  let offset = 58; // skip hash + CRLF
+  const cmd = bytes[offset]; // 1 = TCP
+  const addressType = bytes[offset + 1];
+  offset += 2;
+  let addressRemote = '';
+  let addressLength = 0;
+  switch (addressType) {
+    case 1:
+      addressLength = 4;
+      addressRemote = Array.from(bytes.slice(offset, offset + 4)).join('.');
+      break;
+    case 3:
+      addressLength = bytes[offset];
+      offset += 1;
+      addressRemote = new TextDecoder().decode(bytes.slice(offset, offset + addressLength));
+      break;
+    case 4:
+      addressLength = 16;
+      { const ipv6 = []; const dv = new DataView(buffer.slice(offset, offset + 16));
+        for (let i = 0; i < 8; i++) ipv6.push(dv.getUint16(i * 2).toString(16).padStart(4, '0'));
+        addressRemote = ipv6.join(':'); }
+      break;
+    default:
+      return { hasError: true, message: 'invalid trojan address type' };
+  }
+  const portIndex = offset + addressLength;
+  const portRemote = new DataView(buffer.slice(portIndex, portIndex + 2)).getUint16(0, false);
+  const rawDataIndex = portIndex + 2 + 2; // + CRLF after the request
+  return { hasError: false, hashHex, addressRemote, portRemote, rawDataIndex, isUDP: cmd === 3 };
+}
+
 function makeReadableWebSocketStream(webSocket, earlyData) {
   let cancelled = false;
   return new ReadableStream({
     start(controller) {
       webSocket.addEventListener('message', e => {
-        if (!cancelled) controller.enqueue(e.data);
+        if (cancelled) return;
+        // WS text frames arrive as strings; the protocol parsers need raw bytes.
+        if (typeof e.data === 'string') {
+          controller.enqueue(new TextEncoder().encode(e.data).buffer);
+        } else {
+          controller.enqueue(e.data);
+        }
       });
       webSocket.addEventListener('close', () => { try { controller.close(); } catch (_) {} });
       webSocket.addEventListener('error', err => controller.error(err));
@@ -247,12 +490,77 @@ function makeReadableWebSocketStream(webSocket, earlyData) {
   });
 }
 
-async function handleVLESSWebSocket(request, env, settings) {
+// ──────────────────────────── Credential index & usage accounting ────────────────────────────
+// Builds a lookup of every valid credential (the admin's global UUID/password, plus every
+// user's own UUID/trojan password) so a connecting client identifies to a specific record.
+function buildCredentialIndex(settings, users) {
+  const byUUID = new Map();
+  const byTrojanHash = new Map();
+  byUUID.set(settings.uuid.toLowerCase(), { kind: 'admin' });
+  byTrojanHash.set(sha224Hex(settings.trojanPassword), { kind: 'admin' });
+  for (const u of users) {
+    if (u.enabled === false) continue;
+    if (u.uuid) byUUID.set(String(u.uuid).toLowerCase(), { kind: 'user', user: u });
+    if (u.trojanPassword) byTrojanHash.set(sha224Hex(u.trojanPassword), { kind: 'user', user: u });
+  }
+  return { byUUID, byTrojanHash };
+}
+
+function isUserBlocked(user) {
+  if (!user) return null;
+  if (user.enabled === false) return 'disabled';
+  if (user.expire) {
+    const exp = new Date(user.expire + 'T23:59:59');
+    if (!isNaN(exp) && Date.now() > exp.getTime()) return 'expired';
+  }
+  if (user.traffic > 0 && (user.used || 0) >= user.traffic) return 'traffic-limit';
+  return null;
+}
+
+const GB = 1024 * 1024 * 1024;
+
+// Persists accumulated bytes for a connection to KV once it ends (not per-chunk — that
+// would be far too many writes). Best-effort / eventually-consistent, same limitation the
+// README already called out for real traffic counting on Workers.
+async function flushUsage(env, identity, totalBytes) {
+  if (!identity || identity.kind !== 'user' || totalBytes <= 0) return;
+  try {
+    const users = await getUsers(env);
+    const idx = users.findIndex(x => x.id === identity.user.id);
+    if (idx === -1) return;
+    users[idx].used = +(((users[idx].used || 0) + totalBytes / GB).toFixed(4));
+    users[idx].lastSeen = new Date().toISOString();
+    await saveUsers(env, users);
+    if (users[idx].subId) {
+      const subs = await getSubs(env);
+      const sidx = subs.findIndex(x => x.id === users[idx].subId);
+      if (sidx !== -1) {
+        subs[sidx].used = +(((subs[sidx].used || 0) + totalBytes / GB).toFixed(4));
+        await saveSubs(env, subs);
+      }
+    }
+  } catch (e) { /* best-effort */ }
+}
+
+async function handleVLESSWebSocket(request, env, settings, ctx) {
   const webSocketPair = new WebSocketPair();
   const [client, webSocket] = Object.values(webSocketPair);
   webSocket.accept();
 
+  const users = await getUsers(env);
+  const creds = buildCredentialIndex(settings, users);
+
   let remoteSocket = { value: null };
+  let identity = null;
+  let bytesUp = 0, bytesDown = 0;
+  let flushed = false;
+  const doFlush = () => {
+    if (flushed) return;
+    flushed = true;
+    const total = bytesUp + bytesDown;
+    if (total > 0) ctx.waitUntil(flushUsage(env, identity, total));
+  };
+
   const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
   const { data: earlyData } = base64ToArrayBuffer(earlyDataHeader);
   const readable = makeReadableWebSocketStream(webSocket, earlyData);
@@ -260,22 +568,45 @@ async function handleVLESSWebSocket(request, env, settings) {
   readable.pipeTo(new WritableStream({
     async write(chunk) {
       if (remoteSocket.value) {
+        bytesUp += chunk.byteLength || 0;
         const writer = remoteSocket.value.writable.getWriter();
         await writer.write(chunk);
         writer.releaseLock();
         return;
       }
-      const parsed = processVlessHeader(chunk, settings.uuid);
+
+      const bytes = new Uint8Array(chunk);
+      const isTrojan = looksLikeTrojan(bytes);
+      const parsed = isTrojan ? processTrojanHeader(chunk) : processVlessHeader(chunk);
       if (parsed.hasError) {
         webSocket.close(1000, parsed.message);
         return;
       }
-      const { addressRemote, portRemote, rawDataIndex, vlessVersion, isUDP } = parsed;
+
+      // Identify who is connecting and enforce their limits BEFORE dialing out.
+      const match = isTrojan ? creds.byTrojanHash.get(parsed.hashHex) : creds.byUUID.get((parsed.uuidStr || '').toLowerCase());
+      if (!match) {
+        webSocket.close(1000, isTrojan ? 'invalid trojan password' : 'invalid uuid');
+        return;
+      }
+      const blockReason = match.kind === 'user' ? isUserBlocked(match.user) : null;
+      if (blockReason) {
+        webSocket.close(1000, 'blocked: ' + blockReason);
+        return;
+      }
+      identity = match;
+      // Note: real concurrent-device limiting isn't reliably enforceable on a distributed
+      // edge platform like Workers (there's no single process to count live connections
+      // across). "Max Devices" is kept as an informational field the admin sets manually
+      // rather than a hard technical limit — this is stated plainly in the README.
+
+      const { addressRemote, portRemote, rawDataIndex, isUDP } = parsed;
       if (isUDP) {
         webSocket.close(1000, 'UDP not fully supported in this build');
         return;
       }
       const rawClientData = chunk.slice(rawDataIndex);
+      bytesUp += rawClientData.byteLength || 0;
       const target = settings.proxyIP || addressRemote;
       try {
         const sock = connect({ hostname: target, port: portRemote });
@@ -284,20 +615,27 @@ async function handleVLESSWebSocket(request, env, settings) {
         await writer.write(rawClientData);
         writer.releaseLock();
 
-        // Response header
-        const resp = new Uint8Array([vlessVersion[0], 0]);
-        webSocket.send(resp);
+        if (!isTrojan) {
+          // VLESS response header (Trojan has no response header)
+          const resp = new Uint8Array([parsed.vlessVersion[0], 0]);
+          webSocket.send(resp);
+        }
 
         sock.readable.pipeTo(new WritableStream({
-          write(data) { webSocket.send(data); },
-          close() { try { webSocket.close(); } catch (_) {} },
-          abort() { try { webSocket.close(); } catch (_) {} }
-        })).catch(() => {});
+          write(data) {
+            bytesDown += data.byteLength || 0;
+            webSocket.send(data);
+          },
+          close() { doFlush(); try { webSocket.close(); } catch (_) {} },
+          abort() { doFlush(); try { webSocket.close(); } catch (_) {} }
+        })).catch(() => { doFlush(); });
       } catch (e) {
         webSocket.close(1000, 'connect failed');
       }
-    }
-  })).catch(() => {});
+    },
+    close() { doFlush(); },
+    abort() { doFlush(); }
+  })).catch(() => { doFlush(); });
 
   return new Response(null, { status: 101, webSocket: client });
 }
@@ -432,6 +770,7 @@ label.lbl{display:block;margin-bottom:.1rem;font-size:.7rem;color:var(--muted)}
     <a class="active" data-t="dash">${isFa ? 'داشبورد' : 'Dashboard'}</a>
     <a data-t="subs">${isFa ? 'ساب‌لینک' : 'Subs'}</a>
     <a data-t="users">${isFa ? 'کاربران' : 'Users'}</a>
+    <a data-t="usage">${isFa ? 'مصرف' : 'Usage'}</a>
     <a data-t="warp">Warp</a>
     <a data-t="clients">${isFa ? 'کلاینت‌ها' : 'Clients'}</a>
     <a data-t="set">${isFa ? 'تنظیمات' : 'Settings'}</a>
@@ -442,9 +781,21 @@ label.lbl{display:block;margin-bottom:.1rem;font-size:.7rem;color:var(--muted)}
       <div class="stats" id="dashStats">
         <div class="stat"><div class="stat-value" id="sUsers">0</div><div class="stat-label">${isFa ? 'کاربران' : 'Users'}</div></div>
         <div class="stat"><div class="stat-value" id="sSubs">0</div><div class="stat-label">${isFa ? 'ساب‌لینک' : 'Subs'}</div></div>
-        <div class="stat"><div class="stat-value">—</div><div class="stat-label">${isFa ? 'ترافیک' : 'Traffic'}</div></div>
+        <div class="stat"><div class="stat-value" id="sTraffic">—</div><div class="stat-label">${isFa ? 'ترافیک مصرفی' : 'Traffic Used'}</div></div>
         <div class="stat"><div class="stat-value">ON</div><div class="stat-label">Worker</div></div>
       </div>
+    </div>
+  </div>
+
+  <div id="tab-usage" class="hidden">
+    <div class="card">
+      <h2>${isFa ? 'مصرف کاربران' : 'Usage by User'}</h2>
+      <p class="muted" style="margin-bottom:.5rem">${isFa ? 'شمارش تقریبی و لحظه‌ای است (محدودیت شناخته‌شده Workers)' : 'Approximate, best-effort counting (a known Workers limitation)'}</p>
+      <div id="usageUsersList"></div>
+    </div>
+    <div class="card">
+      <h2>${isFa ? 'مصرف ساب‌لینک‌ها' : 'Usage by Sub'}</h2>
+      <div id="usageSubsList"></div>
     </div>
   </div>
 
@@ -620,25 +971,54 @@ document.querySelectorAll('.nav a[data-t]').forEach(a=>{
   a.onclick=e=>{e.preventDefault();
     document.querySelectorAll('.nav a').forEach(x=>x.classList.remove('active'));
     a.classList.add('active');
-    ['dash','subs','users','warp','clients','set'].forEach(t=>{
+    ['dash','subs','users','usage','warp','clients','set'].forEach(t=>{
       document.getElementById('tab-'+t).classList.toggle('hidden', a.dataset.t!==t);
     });
   }
 });
 
+let usage = {totalUsed:0,totalCap:0,users:[],subs:[]};
 async function loadAll(){
-  const [s,sb,u] = await Promise.all([
+  const [s,sb,u,ug] = await Promise.all([
     fetch('/api/settings').then(r=>r.json()),
     fetch('/api/subs').then(r=>r.json()),
-    fetch('/api/users').then(r=>r.json())
+    fetch('/api/users').then(r=>r.json()),
+    fetch('/api/usage').then(r=>r.json())
   ]);
-  settings=s; subs=sb; users=u;
+  settings=s; subs=sb; users=u; usage=ug;
   render();
+}
+
+function fmtGB(n){ return (Math.round((n||0)*100)/100)+' GB'; }
+
+function renderUsage(){
+  document.getElementById('sTraffic').textContent = fmtGB(usage.totalUsed) + (usage.totalCap>0 ? (' / '+fmtGB(usage.totalCap)) : '');
+  const ul = document.getElementById('usageUsersList');
+  if(!usage.users || !usage.users.length){ ul.innerHTML='<p class="muted">'+(isFa?'داده‌ای نیست':'No data yet')+'</p>'; }
+  else {
+    ul.innerHTML = usage.users.slice().sort((a,b)=>(b.used||0)-(a.used||0)).map(u=>{
+      const pct = u.traffic>0 ? Math.min(100, Math.round((u.used||0)/u.traffic*100)) : 0;
+      return '<div class="progress-wrap"><div class="progress-head"><span>'+esc(u.name)+(u.enabled===false?' <span class="badge badge-yellow">'+(isFa?'غیرفعال':'Off')+'</span>':'')+'</span>'+
+        '<span>'+fmtGB(u.used)+' / '+(u.traffic?fmtGB(u.traffic):'∞')+'</span></div>'+
+        '<div class="progress-bar"><div class="progress-fill" style="width:'+pct+'%"></div></div></div>';
+    }).join('');
+  }
+  const sl = document.getElementById('usageSubsList');
+  if(!usage.subs || !usage.subs.length){ sl.innerHTML='<p class="muted">'+(isFa?'داده‌ای نیست':'No data yet')+'</p>'; }
+  else {
+    sl.innerHTML = usage.subs.slice().sort((a,b)=>(b.used||0)-(a.used||0)).map(s=>{
+      const pct = s.traffic>0 ? Math.min(100, Math.round((s.used||0)/s.traffic*100)) : 0;
+      return '<div class="progress-wrap"><div class="progress-head"><span>'+esc(s.name)+'</span>'+
+        '<span>'+fmtGB(s.used)+' / '+(s.traffic?fmtGB(s.traffic):'∞')+'</span></div>'+
+        '<div class="progress-bar"><div class="progress-fill" style="width:'+pct+'%"></div></div></div>';
+    }).join('');
+  }
 }
 
 function render(){
   document.getElementById('sUsers').textContent = users.length;
   document.getElementById('sSubs').textContent = subs.length;
+  renderUsage();
   document.getElementById('setUUID').value = settings.uuid||'';
   document.getElementById('setTrojan').value = settings.trojanPassword||'';
   document.getElementById('setFP').value = settings.fingerprint||'chrome';
@@ -678,16 +1058,19 @@ function render(){
       const used = u.used||0;
       const total = u.traffic||0;
       const pct = total>0 ? Math.min(100, Math.round(used/total*100)) : 0;
+      const link = location.origin+'/sub/u/'+u.id;
       return '<div class="user-card">'+
         '<div class="user-card-head"><div><strong>'+esc(u.name)+'</strong> <span class="badge">'+(u.enabled!==false?(isFa?'فعال':'Active'):(isFa?'غیرفعال':'Off'))+'</span>'+
         (u.note?'<div class="user-meta">'+esc(u.note)+'</div>':'')+'</div>'+
         '<div style="display:flex;gap:.25rem;flex-wrap:wrap">'+
+        '<button class="btn-outline btn-sm" onclick="copyText(\\''+link+'\\')">'+(isFa?'کپی لینک':'Copy Link')+'</button>'+
         '<button class="btn-outline btn-sm" onclick="editUser(\\''+u.id+'\\')">'+(isFa?'ویرایش':'Edit')+'</button>'+
         '<button class="btn-blue btn-sm" onclick="resetUser(\\''+u.id+'\\')">'+(isFa?'ریست':'Reset')+'</button>'+
         '<button class="btn-danger btn-sm" onclick="delUser(\\''+u.id+'\\')">'+(isFa?'حذف':'Del')+'</button></div></div>'+
-        '<div class="progress-wrap"><div class="progress-head"><span>'+(isFa?'ترافیک':'Traffic')+'</span><span>'+used+' / '+(total||'∞')+' GB</span></div>'+
+        '<div class="config-box" style="margin:.3rem 0;font-size:.62rem">'+link+'</div>'+
+        '<div class="progress-wrap"><div class="progress-head"><span>'+(isFa?'ترافیک':'Traffic')+'</span><span>'+fmtGB(used)+' / '+(total?fmtGB(total):'∞')+'</span></div>'+
         '<div class="progress-bar"><div class="progress-fill" style="width:'+pct+'%"></div></div></div>'+
-        '<div class="muted" style="font-size:.7rem;margin-top:.2rem">'+(isFa?'دستگاه':'Devices')+': '+(u.devices||0)+'/'+(u.maxDevices||'∞')+' · '+(isFa?'انقضا':'Exp')+': '+(u.expire||'-')+'</div></div>';
+        '<div class="muted" style="font-size:.7rem;margin-top:.2rem">'+(isFa?'دستگاه':'Devices')+': '+(u.devices||0)+'/'+(u.maxDevices||'∞')+' · '+(isFa?'انقضا':'Exp')+': '+(u.expire||'-')+(u.lastSeen?(' · '+(isFa?'آخرین اتصال':'Last seen')+': '+new Date(u.lastSeen).toLocaleString(isFa?'fa-IR':'en-US')):'')+'</div></div>';
     }).join('');
   }
 
@@ -858,19 +1241,24 @@ async function handleAPI(request, env, path) {
   const url = new URL(request.url);
   const method = request.method;
 
-  // Login (no auth required)
+  // Login (no auth required) — now rate-limited and constant-time compared.
   if (path === '/api/login' && method === 'POST') {
+    if (await isLoginLocked(request, env)) {
+      return json({ error: 'too many attempts, try again later' }, 429);
+    }
     const body = await request.json().catch(() => ({}));
     const settings = await getSettings(env);
-    if (body.password === settings.password) {
-      const token = await createSession(env);
+    if (safeEqual(body.password, settings.password)) {
+      await clearLoginFailures(request, env);
+      const token = await createSession(env, settings);
       return new Response(JSON.stringify({ ok: true }), {
         headers: {
           'Content-Type': 'application/json',
-          'Set-Cookie': `app_token=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${86400 * 7}`
+          'Set-Cookie': `app_token=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_TTL}`
         }
       });
     }
+    await recordLoginFailure(request, env);
     return json({ error: 'wrong password' }, 401);
   }
 
@@ -884,21 +1272,21 @@ async function handleAPI(request, env, path) {
   }
 
   // Auth required from here
-  const authed = await checkAuth(request, env);
+  const settingsForAuth = await getSettings(env);
+  const authed = await checkAuth(request, env, settingsForAuth);
   if (!authed) return json({ error: 'unauthorized' }, 401);
 
   if (path === '/api/settings') {
     if (method === 'GET') {
-      const s = await getSettings(env);
-      // don't expose password
-      const { password, ...safe } = s;
+      // don't expose password or the session-signing secret
+      const { password, secret, ...safe } = settingsForAuth;
       return json(safe);
     }
     if (method === 'POST') {
       const body = await request.json().catch(() => ({}));
-      const s = await getSettings(env);
-      if (body.password) s.password = body.password;
-      if (body.trojanPassword) s.trojanPassword = body.trojanPassword;
+      const s = settingsForAuth;
+      if (body.password) s.password = String(body.password).slice(0, 200);
+      if (body.trojanPassword) s.trojanPassword = String(body.trojanPassword).slice(0, 200);
       if (body.fingerprint) s.fingerprint = body.fingerprint;
       if (body.fragment) s.fragment = body.fragment;
       if (body.warp) s.warp = body.warp;
@@ -917,9 +1305,10 @@ async function handleAPI(request, env, path) {
       let list = await getSubs(env);
       if (body.id) {
         const idx = list.findIndex(x => x.id === body.id);
-        if (idx >= 0) list[idx] = { ...list[idx], ...body };
+        if (idx >= 0) list[idx] = { ...list[idx], ...body, used: list[idx].used || 0 };
       } else {
         body.id = uuid().slice(0, 8);
+        body.used = 0;
         list.push(body);
       }
       await saveSubs(env, list);
@@ -941,9 +1330,18 @@ async function handleAPI(request, env, path) {
       let list = await getUsers(env);
       if (body.id) {
         const idx = list.findIndex(x => x.id === body.id);
-        if (idx >= 0) list[idx] = { ...list[idx], ...body };
+        if (idx >= 0) {
+          // Never let a plain edit wipe out generated credentials / accumulated usage.
+          const { uuid: _u, trojanPassword: _t, used: _used, devices: _d, ...rest } = body;
+          list[idx] = { ...list[idx], ...rest };
+        }
       } else {
+        // Every real user gets their OWN VLESS UUID and Trojan password — this is what
+        // makes per-user access control (and per-user traffic accounting) actually work,
+        // instead of every client silently sharing the single admin UUID.
         body.id = uuid().slice(0, 8);
+        body.uuid = uuid();
+        body.trojanPassword = 'u' + randomToken(12);
         body.used = 0;
         body.devices = 0;
         body.enabled = true;
@@ -977,6 +1375,19 @@ async function handleAPI(request, env, path) {
     return json({ ok: true });
   }
 
+  // Usage summary — total + per-user + per-sub consumption, for the dashboard/usage tab.
+  if (path === '/api/usage' && method === 'GET') {
+    const [users, subs] = await Promise.all([getUsers(env), getSubs(env)]);
+    const totalUsed = users.reduce((sum, u) => sum + (u.used || 0), 0);
+    const totalCap = users.reduce((sum, u) => sum + (u.traffic || 0), 0);
+    return json({
+      totalUsed: +totalUsed.toFixed(3),
+      totalCap: +totalCap.toFixed(3),
+      users: users.map(u => ({ id: u.id, name: u.name, used: u.used || 0, traffic: u.traffic || 0, lastSeen: u.lastSeen || null, enabled: u.enabled !== false })),
+      subs: subs.map(s => ({ id: s.id, name: s.name, used: s.used || 0, traffic: s.traffic || 0 }))
+    });
+  }
+
   return json({ error: 'not found' }, 404);
 }
 
@@ -984,14 +1395,16 @@ async function handleAPI(request, env, path) {
 export default {
   async fetch(request, env, ctx) {
     try {
-      // Override from env vars if present
+      // Override from env vars if present — only touches KV/memory when something actually changed,
+      // instead of writing settings back on every single request.
       if (env.PASSWORD || env.UUID || env.TROJAN_PASS || env.PROXYIP) {
         const s = await getSettings(env);
-        if (env.PASSWORD) s.password = env.PASSWORD;
-        if (env.UUID && isValidUUID(env.UUID)) s.uuid = env.UUID;
-        if (env.TROJAN_PASS) s.trojanPassword = env.TROJAN_PASS;
-        if (env.PROXYIP) s.proxyIP = env.PROXYIP;
-        await saveSettings(env, s);
+        let changed = false;
+        if (env.PASSWORD && s.password !== env.PASSWORD) { s.password = env.PASSWORD; changed = true; }
+        if (env.UUID && isValidUUID(env.UUID) && s.uuid !== env.UUID) { s.uuid = env.UUID; changed = true; }
+        if (env.TROJAN_PASS && s.trojanPassword !== env.TROJAN_PASS) { s.trojanPassword = env.TROJAN_PASS; changed = true; }
+        if (env.PROXYIP && s.proxyIP !== env.PROXYIP) { s.proxyIP = env.PROXYIP; changed = true; }
+        if (changed) await saveSettings(env, s);
       }
 
       const url = new URL(request.url);
@@ -999,11 +1412,11 @@ export default {
       const host = url.hostname;
       const lang = url.searchParams.get('lang') || 'fa';
 
-      // WebSocket → VLESS
+      // WebSocket → VLESS / Trojan
       const upgrade = request.headers.get('Upgrade') || '';
       if (upgrade.toLowerCase() === 'websocket') {
         const settings = await getSettings(env);
-        return await handleVLESSWebSocket(request, env, settings);
+        return await handleVLESSWebSocket(request, env, settings, ctx);
       }
 
       // API
@@ -1011,7 +1424,23 @@ export default {
         return await handleAPI(request, env, path);
       }
 
-      // Subscription
+      // Personal per-user subscription link: /sub/u/{userId} — uses that user's OWN
+      // uuid/trojanPassword rather than the shared admin credentials.
+      if (path.startsWith(SUB_PATH + '/u/')) {
+        const userId = path.slice((SUB_PATH + '/u/').length).split('/')[0];
+        const settings = await getSettings(env);
+        const users = await getUsers(env);
+        const user = users.find(u => u.id === userId);
+        if (!user) return new Response('user not found', { status: 404 });
+        const subs = await getSubs(env);
+        const linkedSub = subs.find(s => s.id === user.subId) ||
+          { name: user.name || 'user', port: 443, path: '/', protocols: { vless: true, trojan: true }, proxyIP: settings.proxyIP, cleanIPs: settings.cleanIPs };
+        return new Response(generateSubContent(linkedSub, settings, host, user.uuid, user.trojanPassword), {
+          headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Profile-Update-Interval': '6' }
+        });
+      }
+
+      // Subscription (admin / shared)
       if (path.startsWith(SUB_PATH + '/')) {
         const subId = path.slice(SUB_PATH.length + 1).split('/')[0];
         const settings = await getSettings(env);
@@ -1052,7 +1481,8 @@ export default {
       // Panel
       if (path === PANEL_PATH || path === PANEL_PATH + '/' || path === '/') {
         if (path === '/') return redirect(`${url.origin}${PANEL_PATH}?lang=${lang}`);
-        const authed = await checkAuth(request, env);
+        const settings = await getSettings(env);
+        const authed = await checkAuth(request, env, settings);
         return html(getPanelHTML(lang, authed));
       }
 

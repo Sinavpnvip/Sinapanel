@@ -10,7 +10,7 @@ compatibility_flags = ["nodejs_compat"]
 
 # Optional environment variables (can also set in dashboard):
 # [vars]
-# PASSWORD = "123456"
+# PASSWORD = "sfdns990"
 # UUID = "your-uuid-here"
 # TROJAN_PASS = "your-trojan-password"
 # PROXYIP = ""
