@@ -1,7 +1,7 @@
-name = "app-panel"
-main = "worker.js"
-compatibility_date = "2024-09-23"
-compatibility_flags = ["nodejs_compat"]
+[[d1_databases]]
+binding = "APP_DB"
+database_name = "app_panel_db"
+database_id = "ID_دیتابیس_شما"at"]
 
 # Uncomment and set your KV namespace after creating it:
 # [[kv_namespaces]]
