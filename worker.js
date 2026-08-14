@@ -125,6 +125,7 @@ const SFDNS_V2 = {
  *   APP Panel  ·  Advanced Proxy Panel  v1.1
  *   پنل پروکسی پیشرفته — نسخه واقعی
  * ═══════════════════════════════════════════════════════════════
+ *  Performance build: edge-local caches + live endpoint health testing
  *  Default Password: sfdns990 (change it after first login!)
  *  Works on Cloudflare Workers + Pages
  *  Requires KV binding: APP_KV
@@ -304,7 +305,9 @@ function defaultSettings() {
     fragment: { length: '10-20', interval: '10-20', packets: 'tlshello' },
     warp: { enabled: false, pro: false, endpoint: '' },
     proxyIP: '',
-    cleanIPs: []
+    cleanIPs: [],
+    // Admin-managed endpoints only. No harvested public proxy list is bundled.
+    brainPool: []
   };
 }
 
@@ -323,22 +326,44 @@ function defaultUsers() {
 // A KV binding is strongly recommended for real deployments — see README.
 const MEM = {
   settings: null,
+  settingsAt: 0,
   subs: null,
+  subsAt: 0,
   users: null,
+  usersAt: 0,
+  credentialIndex: null,
+  credentialAt: 0,
   loginAttempts: new Map() // ip -> { count, until }
 };
 
+const CACHE_TTL_MS = 5000; // short edge-local cache: fast connections, bounded config staleness
+const BRAIN_MAX_ITEMS = 64;
+const BRAIN_TEST_CONCURRENCY = 6;
+const BRAIN_TEST_TIMEOUT_MS = 1800;
+
 // ──────────────────────────── KV Helpers ────────────────────────────
 async function getSettings(env) {
+  const now = Date.now();
+  if (MEM.settings && now - MEM.settingsAt < CACHE_TTL_MS) return MEM.settings;
+
   if (!env.APP_KV) {
     if (!MEM.settings) MEM.settings = defaultSettings();
+    MEM.settingsAt = now;
     return MEM.settings;
   }
+
   const raw = await env.APP_KV.get('settings', 'json');
-  if (raw) return { ...defaultSettings(), ...raw, secret: raw.secret || (await ensurePersistedSecret(env, raw)) };
-  const fresh = defaultSettings();
-  await env.APP_KV.put('settings', JSON.stringify(fresh));
-  return fresh;
+  let value;
+  if (raw) {
+    value = { ...defaultSettings(), ...raw };
+    if (!value.secret) value.secret = await ensurePersistedSecret(env, value);
+  } else {
+    value = defaultSettings();
+    await env.APP_KV.put('settings', JSON.stringify(value));
+  }
+  MEM.settings = value;
+  MEM.settingsAt = now;
+  return value;
 }
 
 async function ensurePersistedSecret(env, raw) {
@@ -348,30 +373,60 @@ async function ensurePersistedSecret(env, raw) {
 }
 
 async function saveSettings(env, data) {
-  if (!env.APP_KV) { MEM.settings = data; return; }
+  MEM.settings = data;
+  MEM.settingsAt = Date.now();
+  MEM.credentialIndex = null;
+  if (!env.APP_KV) return;
   await env.APP_KV.put('settings', JSON.stringify(data));
 }
 
 async function getSubs(env) {
-  if (!env.APP_KV) return (MEM.subs = MEM.subs || defaultSubs());
-  const raw = await env.APP_KV.get('subs', 'json');
-  return raw || defaultSubs();
+  const now = Date.now();
+  if (MEM.subs && now - MEM.subsAt < CACHE_TTL_MS) return MEM.subs;
+  if (!env.APP_KV) {
+    MEM.subs = MEM.subs || defaultSubs();
+  } else {
+    MEM.subs = (await env.APP_KV.get('subs', 'json')) || defaultSubs();
+  }
+  MEM.subsAt = now;
+  return MEM.subs;
 }
 
 async function saveSubs(env, data) {
-  if (!env.APP_KV) { MEM.subs = data; return; }
+  MEM.subs = data;
+  MEM.subsAt = Date.now();
+  if (!env.APP_KV) return;
   await env.APP_KV.put('subs', JSON.stringify(data));
 }
 
 async function getUsers(env) {
-  if (!env.APP_KV) return (MEM.users = MEM.users || defaultUsers());
-  const raw = await env.APP_KV.get('users', 'json');
-  return raw || defaultUsers();
+  const now = Date.now();
+  if (MEM.users && now - MEM.usersAt < CACHE_TTL_MS) return MEM.users;
+  if (!env.APP_KV) {
+    MEM.users = MEM.users || defaultUsers();
+  } else {
+    MEM.users = (await env.APP_KV.get('users', 'json')) || defaultUsers();
+  }
+  MEM.usersAt = now;
+  return MEM.users;
 }
 
 async function saveUsers(env, data) {
-  if (!env.APP_KV) { MEM.users = data; return; }
+  MEM.users = data;
+  MEM.usersAt = Date.now();
+  MEM.credentialIndex = null;
+  if (!env.APP_KV) return;
   await env.APP_KV.put('users', JSON.stringify(data));
+}
+
+async function getCredentialIndex(env, settings) {
+  const now = Date.now();
+  if (MEM.credentialIndex && now - MEM.credentialAt < CACHE_TTL_MS) return MEM.credentialIndex;
+  const users = await getUsers(env);
+  const index = buildCredentialIndex(settings, users);
+  MEM.credentialIndex = index;
+  MEM.credentialAt = now;
+  return index;
 }
 
 // ──────────────────────────── Auth ────────────────────────────
@@ -669,8 +724,7 @@ async function handleVLESSWebSocket(request, env, settings, ctx) {
   const [client, webSocket] = Object.values(webSocketPair);
   webSocket.accept();
 
-  const users = await getUsers(env);
-  const creds = buildCredentialIndex(settings, users);
+  const creds = await getCredentialIndex(env, settings);
 
   let remoteSocket = { value: null };
   let identity = null;
@@ -1074,14 +1128,7 @@ label.lbl{display:block;margin-bottom:.1rem;font-size:.7rem;color:var(--muted)}
 const isFa = ${isFa ? 'true' : 'false'};
 let settings = {}, subs = [], users = [];
 let brainMode = 'proxy';
-const BRAIN_IPS = [
-  {ip:'104.16.128.50', ms:42},
-  {ip:'104.17.176.20', ms:55},
-  {ip:'104.18.22.100', ms:68},
-  {ip:'104.21.48.10', ms:38},
-  {ip:'cdnjs.cloudflare.com', ms:31},
-  {ip:'cloudflare.com', ms:78}
-];
+const const BRAIN_IPS = [];
 
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200)}
 function openModal(id){document.getElementById(id).classList.add('show')}
@@ -1142,6 +1189,8 @@ function render(){
   document.getElementById('sSubs').textContent = subs.length;
   renderUsage();
   document.getElementById('setUUID').value = settings.uuid||'';
+  const brainField = document.getElementById('setBrainPool');
+  if(brainField) brainField.value = (settings.brainPool||[]).map(x=>typeof x==='string'?x:x.endpoint).join('\n');
   document.getElementById('setTrojan').value = settings.trojanPassword||'';
   document.getElementById('setFP').value = settings.fingerprint||'chrome';
   if(settings.fragment){document.getElementById('setFragLen').value=settings.fragment.length||'10-20';document.getElementById('setFragInt').value=settings.fragment.interval||'10-20'}
@@ -1373,6 +1422,73 @@ loadAll();
 }
 
 // ──────────────────────────── API Handlers ────────────────────────────
+
+function parseBrainEndpoint(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  let host = raw, port = 443;
+  if (raw.includes('://')) {
+    try {
+      const u = new URL(raw);
+      host = u.hostname;
+      port = Number(u.port || (u.protocol === 'http:' ? 80 : 443));
+    } catch { return null; }
+  } else if (raw.startsWith('[')) {
+    const end = raw.indexOf(']');
+    if (end < 0) return null;
+    host = raw.slice(1, end);
+    if (raw[end + 1] === ':') port = Number(raw.slice(end + 2));
+  } else {
+    const parts = raw.split(':');
+    if (parts.length === 2 && /^\d+$/.test(parts[1])) {
+      host = parts[0];
+      port = Number(parts[1]);
+    }
+  }
+  if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return { host, port };
+}
+
+async function testBrainEndpoint(value) {
+  const ep = parseBrainEndpoint(value);
+  if (!ep) return { endpoint: value, ok: false, error: 'invalid endpoint' };
+
+  const started = Date.now();
+  let socket;
+  try {
+    socket = connect({ hostname: ep.host, port: ep.port });
+    await Promise.race([
+      socket.opened,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), BRAIN_TEST_TIMEOUT_MS))
+    ]);
+    const ms = Date.now() - started;
+    try { socket.close(); } catch {}
+    return { endpoint: value, host: ep.host, port: ep.port, ok: true, ms };
+  } catch (e) {
+    try { socket?.close(); } catch {}
+    return { endpoint: value, host: ep.host, port: ep.port, ok: false, ms: Date.now() - started, error: String(e?.message || e) };
+  }
+}
+
+async function testBrainBatch(items) {
+  const clean = [...new Set((Array.isArray(items) ? items : [])
+    .map(x => typeof x === 'string' ? x : x?.endpoint)
+    .map(x => String(x || '').trim())
+    .filter(Boolean))].slice(0, BRAIN_MAX_ITEMS);
+
+  const out = new Array(clean.length);
+  let cursor = 0;
+  async function worker() {
+    while (true) {
+      const i = cursor++;
+      if (i >= clean.length) return;
+      out[i] = await testBrainEndpoint(clean[i]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(BRAIN_TEST_CONCURRENCY, clean.length) }, worker));
+  return out.filter(Boolean).sort((a,b) => (a.ok ? 0 : 1) - (b.ok ? 0 : 1) || (a.ms ?? 99999) - (b.ms ?? 99999));
+}
+
 async function handleAPI(request, env, path) {
   const url = new URL(request.url);
   const method = request.method;
@@ -1412,6 +1528,20 @@ async function handleAPI(request, env, path) {
   const authed = await checkAuth(request, env, settingsForAuth);
   if (!authed) return json({ error: 'unauthorized' }, 401);
 
+  if (path === '/api/brain' && method === 'GET') {
+    const settings = settingsForAuth;
+    const list = Array.isArray(settings.brainPool) ? settings.brainPool.slice(0, BRAIN_MAX_ITEMS) : [];
+    return json(list.map(x => typeof x === 'string' ? { endpoint: x } : x));
+  }
+
+  if (path === '/api/brain/test' && method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    const items = Array.isArray(body.items) ? body.items : [];
+    if (!items.length) return json({ ok: false, error: 'items is required' }, 400);
+    const results = await testBrainBatch(items);
+    return json({ ok: true, results });
+  }
+
   if (path === '/api/settings') {
     if (method === 'GET') {
       // don't expose password or the session-signing secret
@@ -1427,7 +1557,8 @@ async function handleAPI(request, env, path) {
       if (body.fragment) s.fragment = body.fragment;
       if (body.warp) s.warp = body.warp;
       if (body.proxyIP !== undefined) s.proxyIP = body.proxyIP;
-      if (body.cleanIPs) s.cleanIPs = body.cleanIPs;
+      if (body.cleanIPs) s.cleanIPs = Array.isArray(body.cleanIPs) ? body.cleanIPs.slice(0, BRAIN_MAX_ITEMS) : s.cleanIPs;
+      if (body.brainPool) s.brainPool = Array.isArray(body.brainPool) ? body.brainPool.slice(0, BRAIN_MAX_ITEMS) : [];
       if (body.newUUID) s.uuid = uuid();
       await saveSettings(env, s);
       return json({ ok: true });

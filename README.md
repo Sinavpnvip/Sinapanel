@@ -105,3 +105,13 @@ MIT
 - Frontend error handling can display the server error instead of a generic `Error`.
 - Existing protocol implementation and legacy KV array format are preserved.
 - `APP_KV` must be configured in Cloudflare Workers.
+
+
+## v3 Performance / Stability
+- Edge-local 5s caches for settings/users/subscriptions reduce KV reads on every connection.
+- Credential index is cached and invalidated when users/settings change.
+- WebSocket connection setup no longer reads the entire users list for every connection.
+- Added authenticated Brain endpoint health testing with bounded concurrency and timeout.
+- Brain is admin-managed: the build does not bundle a harvested public-proxy list.
+- Brain results are ranked by availability and latency.
+- The existing protocol implementation is preserved rather than replaced blindly.
