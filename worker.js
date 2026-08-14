@@ -1,7 +1,7 @@
 /**
  * ═══════════════════════════════════════════════════════════════
- *   APP Panel  ·  Advanced Proxy Panel  v2.1 (Final Enterprise)
- *   پنل پروکسی پیشرفته — پشتیبانی کامل از D1، UUID اختصاصی و UI ساب
+ *   APP Panel  ·  Advanced Proxy Panel  v2.2 (Neon Dark Edition)
+ *   پنل پروکسی پیشرفته — رفع باگ اتصال + تم تاریک نئونی
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -94,21 +94,10 @@ async function getSubs(env) {
   try {
     const { results } = await env.APP_DB.prepare("SELECT * FROM subs").all();
     return results.map(row => ({
-      id: row.id,
-      name: row.name,
-      traffic: row.traffic,
-      maxUsers: row.maxUsers,
-      days: row.days,
-      port: row.port,
-      path: row.path,
-      protocols: JSON.parse(row.protocols || '{}'),
-      proxyIP: row.proxyIP,
-      cleanIPs: JSON.parse(row.cleanIPs || '[]'),
-      routing: JSON.parse(row.routing || '{}')
+      id: row.id, name: row.name, traffic: row.traffic, maxUsers: row.maxUsers, days: row.days, port: row.port, path: row.path,
+      protocols: JSON.parse(row.protocols || '{}'), proxyIP: row.proxyIP, cleanIPs: JSON.parse(row.cleanIPs || '[]'), routing: JSON.parse(row.routing || '{}')
     }));
-  } catch (e) {
-    return [];
-  }
+  } catch (e) { return []; }
 }
 
 async function saveSub(env, sub) {
@@ -131,20 +120,9 @@ async function getUsers(env) {
   try {
     const { results } = await env.APP_DB.prepare("SELECT * FROM users").all();
     return results.map(row => ({
-      id: row.id,
-      name: row.name,
-      uuid: row.uuid,
-      used: row.used,
-      traffic: row.traffic,
-      expire: row.expire,
-      maxDevices: row.maxDevices,
-      subId: row.subId,
-      note: row.note,
-      enabled: row.enabled === 1
+      id: row.id, name: row.name, uuid: row.uuid, used: row.used, traffic: row.traffic, expire: row.expire, maxDevices: row.maxDevices, subId: row.subId, note: row.note, enabled: row.enabled === 1
     }));
-  } catch (e) {
-    return [];
-  }
+  } catch (e) { return []; }
 }
 
 async function saveUser(env, user) {
@@ -159,6 +137,12 @@ async function saveUser(env, user) {
 async function deleteUser(env, id) {
   if (!env.APP_DB) return;
   await env.APP_DB.prepare("DELETE FROM users WHERE id = ?").bind(id).run();
+}
+
+async function getUserByUUID(env, uuidStr) {
+  if (!env.APP_DB) return null;
+  const user = await env.APP_DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(uuidStr).first();
+  return user;
 }
 
 async function updateUserTraffic(env, userId, bytesToAdd) {
@@ -195,13 +179,7 @@ async function createSession(env) {
 function generateVlessLink(host, userUuid, port, path, remark, proxyIP) {
   const address = proxyIP || host;
   const params = new URLSearchParams({
-    encryption: 'none',
-    security: 'tls',
-    sni: host,
-    fp: 'chrome',
-    type: 'ws',
-    host: host,
-    path: path || '/'
+    encryption: 'none', security: 'tls', sni: host, fp: 'chrome', type: 'ws', host: host, path: path || '/'
   });
   return `vless://${userUuid}@${address}:${port}?${params.toString()}#${encodeURIComponent(remark || 'APP')}`;
 }
@@ -209,12 +187,7 @@ function generateVlessLink(host, userUuid, port, path, remark, proxyIP) {
 function generateTrojanLink(host, password, port, path, remark, proxyIP) {
   const address = proxyIP || host;
   const params = new URLSearchParams({
-    security: 'tls',
-    sni: host,
-    fp: 'chrome',
-    type: 'ws',
-    host: host,
-    path: path || '/'
+    security: 'tls', sni: host, fp: 'chrome', type: 'ws', host: host, path: path || '/'
   });
   return `trojan://${password}@${address}:${port}?${params.toString()}#${encodeURIComponent(remark || 'APP-Trojan')}`;
 }
@@ -275,7 +248,7 @@ function processVlessHeader(buffer, expectedUUID) {
     .replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5');
   
   if (uuidStr.toLowerCase() !== expectedUUID.toLowerCase()) {
-    return { hasError: true, message: 'invalid uuid' };
+    return { hasError: true, message: 'invalid uuid', uuidStr };
   }
   
   const optLen = new Uint8Array(buffer.slice(17, 18))[0];
@@ -314,23 +287,14 @@ function processVlessHeader(buffer, expectedUUID) {
   }
   
   const rawDataIndex = addressIndex + addressLength;
-  return {
-    hasError: false,
-    addressRemote,
-    portRemote,
-    rawDataIndex,
-    vlessVersion: new Uint8Array([version]),
-    isUDP
-  };
+  return { hasError: false, addressRemote, portRemote, rawDataIndex, vlessVersion: new Uint8Array([version]), isUDP, uuidStr };
 }
 
 function makeReadableWebSocketStream(webSocket, earlyData) {
   let cancelled = false;
   return new ReadableStream({
     start(controller) {
-      webSocket.addEventListener('message', e => {
-        if (!cancelled) controller.enqueue(e.data);
-      });
+      webSocket.addEventListener('message', e => { if (!cancelled) controller.enqueue(e.data); });
       webSocket.addEventListener('close', () => { try { controller.close(); } catch (_) {} });
       webSocket.addEventListener('error', err => controller.error(err));
       if (earlyData) controller.enqueue(earlyData);
@@ -351,6 +315,7 @@ async function handleVLESSWebSocket(request, env, settings, currentUser, ctx) {
 
   let isUserBlocked = false;
   let accumulatedBytes = 0;
+  let userLoaded = false; 
 
   readable.pipeTo(new WritableStream({
     async write(chunk) {
@@ -359,7 +324,7 @@ async function handleVLESSWebSocket(request, env, settings, currentUser, ctx) {
         await writer.write(chunk);
         writer.releaseLock();
         
-        if (currentUser && !isUserBlocked) {
+        if (userLoaded && currentUser && !isUserBlocked) {
           const chunkBytes = chunk.byteLength || chunk.length || 0;
           accumulatedBytes += chunkBytes;
           
@@ -383,6 +348,12 @@ async function handleVLESSWebSocket(request, env, settings, currentUser, ctx) {
       
       const expectedUUID = currentUser ? currentUser.uuid : settings.uuid;
       const parsed = processVlessHeader(chunk, expectedUUID);
+      
+      if (!currentUser && env.APP_DB && parsed.uuidStr) {
+        currentUser = await getUserByUUID(env, parsed.uuidStr);
+        userLoaded = true;
+      }
+
       if (parsed.hasError) {
         webSocket.close(1000, parsed.message);
         return;
@@ -390,7 +361,7 @@ async function handleVLESSWebSocket(request, env, settings, currentUser, ctx) {
       
       const { addressRemote, portRemote, rawDataIndex, vlessVersion, isUDP } = parsed;
       if (isUDP) {
-        webSocket.close(1000, 'UDP not fully supported in this build');
+        webSocket.close(1000, 'UDP not supported');
         return;
       }
       
@@ -411,7 +382,7 @@ async function handleVLESSWebSocket(request, env, settings, currentUser, ctx) {
           write(data) { 
             if (!isUserBlocked) {
               webSocket.send(data); 
-              if (currentUser) {
+              if (userLoaded && currentUser) {
                 accumulatedBytes += data.byteLength || data.length || 0;
                 if (accumulatedBytes > 1048576) {
                   ctx.waitUntil(updateUserTraffic(env, currentUser.id, accumulatedBytes));
@@ -431,7 +402,7 @@ async function handleVLESSWebSocket(request, env, settings, currentUser, ctx) {
   })).catch(() => {});
 
   webSocket.addEventListener('close', async () => {
-    if (currentUser && env.APP_DB && accumulatedBytes > 0) {
+    if (userLoaded && currentUser && env.APP_DB && accumulatedBytes > 0) {
       await updateUserTraffic(env, currentUser.id, accumulatedBytes);
     }
   });
@@ -439,9 +410,30 @@ async function handleVLESSWebSocket(request, env, settings, currentUser, ctx) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-// ──────────────────────────── Panel HTML (Pro UI) ────────────────────────────
-function getPanelHTML(lang, authenticated) {
+// ──────────────────────────── CSS Theme Generator ────────────────────────────
+function getStyles(isDark) {
+  if (isDark) {
+    return `:root{--bg:#030303;--card:#0a0f0a;--text:#e8ffe8;--muted:#6b8f6b;--light:#0f1a0f;--primary:#00ff88;--primary-hover:#33ffaa;--primary-soft:rgba(0,255,136,.1);--border:rgba(0,255,136,.15);--border2:rgba(0,255,136,.3);--danger:#ff4d6a;--danger-soft:rgba(255,77,106,.1);--success:#00ff88;--success-soft:rgba(0,255,136,.1);--yellow:#ffd166;--yellow-soft:rgba(255,209,102,.1);--blue:#4cc9f0;--blue-soft:rgba(76,201,240,.1);--glow:rgba(0,255,136,.35)}
+    body{background-image:linear-gradient(rgba(0,255,136,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(0,255,136,.02) 1px,transparent 1px);background-size:40px 40px}
+    .card{box-shadow:0 0 15px rgba(0,0,0,.5) inset}
+    .modal{box-shadow:0 0 30px var(--glow)}
+    button,.btn{box-shadow:0 0 10px var(--glow)}
+    .nav a.active{box-shadow:0 0 15px var(--glow)}`;
+  } else {
+    return `:root{--bg:#f8fafc;--card:#ffffff;--text:#1e293b;--muted:#64748b;--light:#f1f5f9;--primary:#4f46e5;--primary-hover:#4338ca;--primary-soft:#eef2ff;--border:#e2e8f0;--border2:#c7d2fe;--danger:#ef4444;--danger-soft:#fef2f2;--success:#10b981;--success-soft:#ecfdf5;--yellow:#f59e0b;--yellow-soft:#fffbeb;--blue:#3b82f6;--blue-soft:#eff6ff;--glow:rgba(79,70,229,.2)}
+    body{background-image:none}
+    .card{box-shadow:0 1px 3px rgba(0,0,0,.03)}
+    .modal{box-shadow:0 20px 25px -5px rgba(0,0,0,.1)}
+    button,.btn{box-shadow:none}
+    .nav a.active{box-shadow:0 4px 6px -1px rgba(79,70,229,.2)}`;
+  }
+}
+
+// ──────────────────────────── Panel HTML ────────────────────────────
+function getPanelHTML(lang, theme, authenticated) {
   const isFa = lang !== 'en';
+  const isDark = theme !== 'light';
+  
   if (!authenticated) {
     return `<!DOCTYPE html>
 <html lang="${isFa ? 'fa' : 'en'}" dir="${isFa ? 'rtl' : 'ltr'}">
@@ -450,20 +442,26 @@ function getPanelHTML(lang, authenticated) {
 <title>APP Panel Login</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700&family=Inter:wght@400;600;700&display=swap');
-:root{--bg:#f8fafc;--card:#ffffff;--text:#1e293b;--muted:#64748b;--primary:#4f46e5;--primary-hover:#4338ca;--border:#e2e8f0;--danger:#ef4444;--success:#10b981}
-*{box-sizing:border-box;margin:0;padding:0;font-family:${isFa?'Vazirmatn':'Inter'},system-ui,sans-serif}
-body{background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center}
-.box{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:2.5rem;width:100%;max-width:380px;text-align:center;box-shadow:0 10px 25px -5px rgba(0,0,0,.05)}
-h1{color:var(--primary);font-size:1.5rem;margin-bottom:.5rem;font-weight:700}
+:root{--bg:#030303;--card:#0a0f0a;--text:#e8ffe8;--muted:#6b8f6b;--light:#0f1a0f;--primary:#00ff88;--primary-hover:#33ffaa;--primary-soft:rgba(0,255,136,.1);--border:rgba(0,255,136,.15);--border2:rgba(0,255,136,.3);--danger:#ff4d6a;--danger-soft:rgba(255,77,106,.1);--success:#00ff88;--success-soft:rgba(0,255,136,.1);--yellow:#ffd166;--yellow-soft:rgba(255,209,102,.1);--blue:#4cc9f0;--blue-soft:rgba(76,201,240,.1);--glow:rgba(0,255,136,.35)}
+*{box-sizing:border-box;margin:0;padding:0;font-family:${isFa?'Vazirmatn':'Inter'},system-ui,sans-serif;transition:background-color .3s,color .3s}
+body{background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;background-image:linear-gradient(rgba(0,255,136,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(0,255,136,.02) 1px,transparent 1px);background-size:40px 40px}
+.box{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:2.5rem;width:100%;max-width:380px;text-align:center;box-shadow:0 0 30px var(--glow)}
+h1{color:var(--primary);font-size:1.5rem;margin-bottom:.5rem;font-weight:700;text-shadow:0 0 10px var(--glow)}
 p{color:var(--muted);font-size:.9rem;margin-bottom:1.5rem}
-input{width:100%;padding:.8rem 1rem;background:#f1f5f9;border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:.95rem;margin-bottom:1rem;transition:.2s}
-input:focus{outline:none;border-color:var(--primary);background:#fff;box-shadow:0 0 0 3px rgba(79,70,229,.1)}
-button{width:100%;padding:.8rem;background:var(--primary);color:#fff;border:none;border-radius:10px;font-weight:600;font-size:.95rem;cursor:pointer;transition:.2s}
+input{width:100%;padding:.8rem 1rem;background:var(--bg);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:.95rem;margin-bottom:1rem;transition:.2s}
+input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-soft)}
+button{width:100%;padding:.8rem;background:var(--primary);color:#000;border:none;border-radius:10px;font-weight:600;font-size:.95rem;cursor:pointer;transition:.2s;box-shadow:0 0 15px var(--glow)}
 button:hover{background:var(--primary-hover)}
 .err{color:var(--danger);font-size:.8rem;margin-top:.75rem;display:none}
+.top-bar{position:fixed;top:1rem;left:1rem;display:flex;gap:.5rem}
+.tb-btn{background:var(--card);border:1px solid var(--border);color:var(--muted);padding:.35rem .65rem;border-radius:8px;cursor:pointer;font-size:.75rem;text-decoration:none}
 </style>
 </head>
 <body>
+<div class="top-bar">
+  <a href="?lang=${isFa?'en':'fa'}&theme=${isDark?'light':'dark'}" class="tb-btn">${isFa?'EN':'FA'}</a>
+  <a href="?lang=${lang}&theme=${isDark?'light':'dark'}" class="tb-btn">${isDark?'☀️ Light':'🌙 Dark'}</a>
+</div>
 <div class="box">
   <h1>APP Panel</h1>
   <p>${isFa ? 'برای ورود رمز عبور را وارد کنید' : 'Enter your password to login'}</p>
@@ -490,39 +488,39 @@ document.getElementById('f').onsubmit=async e=>{
 <title>APP Panel</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
-:root{--bg:#f8fafc;--card:#ffffff;--text:#1e293b;--muted:#64748b;--light:#f1f5f9;--primary:#4f46e5;--primary-hover:#4338ca;--primary-soft:#eef2ff;--border:#e2e8f0;--danger:#ef4444;--danger-soft:#fef2f2;--success:#10b981;--success-soft:#ecfdf5;--yellow:#f59e0b;--yellow-soft:#fffbeb;--blue:#3b82f6;--blue-soft:#eff6ff}
-*{box-sizing:border-box;margin:0;padding:0;font-family:${isFa?'Vazirmatn':'Inter'},system-ui,sans-serif}
-body{background:var(--bg);color:var(--text);min-height:100vh;line-height:1.5}
+:root{--bg:#030303;--card:#0a0f0a;--text:#e8ffe8;--muted:#6b8f6b;--light:#0f1a0f;--primary:#00ff88;--primary-hover:#33ffaa;--primary-soft:rgba(0,255,136,.1);--border:rgba(0,255,136,.15);--border2:rgba(0,255,136,.3);--danger:#ff4d6a;--danger-soft:rgba(255,77,106,.1);--success:#00ff88;--success-soft:rgba(0,255,136,.1);--yellow:#ffd166;--yellow-soft:rgba(255,209,102,.1);--blue:#4cc9f0;--blue-soft:rgba(76,201,240,.1);--glow:rgba(0,255,136,.35)}
+*{box-sizing:border-box;margin:0;padding:0;font-family:${isFa?'Vazirmatn':'Inter'},system-ui,sans-serif;transition:background-color .3s,color .3s,border-color .3s}
+body{background:var(--bg);color:var(--text);min-height:100vh;line-height:1.5;background-image:linear-gradient(rgba(0,255,136,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(0,255,136,.02) 1px,transparent 1px);background-size:40px 40px}
 .container{max-width:1100px;margin:0 auto;padding:1.5rem 1rem 4rem}
 .header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;margin-bottom:2rem;padding-bottom:1.5rem;border-bottom:1px solid var(--border)}
-.logo{font-weight:700;font-size:1.25rem;color:var(--primary);display:flex;align-items:center;gap:.5rem}
-.logo::before{content:'';width:10px;height:10px;background:var(--primary);border-radius:50%}
-.nav{display:flex;flex-wrap:wrap;gap:.25rem;margin-bottom:1.5rem;background:var(--card);padding:.35rem;border-radius:12px;border:1px solid var(--border);box-shadow:0 1px 3px rgba(0,0,0,.03)}
+.logo{font-weight:700;font-size:1.25rem;color:var(--primary);display:flex;align-items:center;gap:.5rem;text-shadow:0 0 10px var(--glow)}
+.logo::before{content:'';width:10px;height:10px;background:var(--primary);border-radius:50%;box-shadow:0 0 10px var(--primary)}
+.nav{display:flex;flex-wrap:wrap;gap:.25rem;margin-bottom:1.5rem;background:var(--card);padding:.35rem;border-radius:12px;border:1px solid var(--border)}
 .nav a{padding:.5rem 1rem;border-radius:8px;color:var(--muted);font-size:.85rem;font-weight:500;cursor:pointer;text-decoration:none;transition:.2s}
-.nav a.active{color:#fff;background:var(--primary);box-shadow:0 4px 6px -1px rgba(79,70,229,.2)}
+.nav a.active{color:#000;background:var(--primary);box-shadow:0 0 15px var(--glow)}
 .nav a:not(.active):hover{background:var(--light);color:var(--text)}
-.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.5rem;margin-bottom:1rem;box-shadow:0 1px 3px rgba(0,0,0,.03)}
-h2{font-size:1.1rem;font-weight:600;margin-bottom:1rem;color:var(--text)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.5rem;margin-bottom:1rem;box-shadow:0 0 15px rgba(0,0,0,.5) inset}
+h2{font-size:1.1rem;font-weight:600;margin-bottom:1rem;color:var(--primary);text-shadow:0 0 8px var(--glow)}
 .muted{color:var(--muted);font-size:.8rem}
 .stats{display:grid;grid-template-columns:repeat(2,1fr);gap:.75rem;margin-bottom:.5rem}
 @media(min-width:680px){.stats{grid-template-columns:repeat(4,1fr)}}
 .stat{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:1rem;text-align:center}
-.stat-value{font-size:1.5rem;font-weight:700;color:var(--primary);margin-bottom:.25rem}
+.stat-value{font-size:1.5rem;font-weight:700;color:var(--primary);margin-bottom:.25rem;text-shadow:0 0 8px var(--glow)}
 .stat-label{font-size:.75rem;color:var(--muted);font-weight:500}
 .progress-wrap{margin:.75rem 0}.progress-head{display:flex;justify-content:space-between;font-size:.75rem;margin-bottom:.35rem;color:var(--muted)}
 .progress-bar{height:8px;background:var(--light);border-radius:99px;overflow:hidden}
-.progress-fill{height:100%;background:var(--primary);border-radius:99px;transition:width .3s ease}
+.progress-fill{height:100%;background:var(--primary);border-radius:99px;transition:width .3s ease;box-shadow:0 0 10px var(--glow)}
 .config-box{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:.75rem;font-family:ui-monospace,monospace;font-size:.75rem;word-break:break-all;position:relative;margin:.5rem 0;color:var(--text)}
-button,.btn{display:inline-flex;align-items:center;gap:.25rem;padding:.5rem 1rem;background:var(--primary);color:#fff;border:none;border-radius:8px;font-size:.8rem;font-weight:500;cursor:pointer;transition:.2s;font-family:inherit}
+button,.btn{display:inline-flex;align-items:center;gap:.25rem;padding:.5rem 1rem;background:var(--primary);color:#000;border:none;border-radius:8px;font-size:.8rem;font-weight:500;cursor:pointer;transition:.2s;font-family:inherit;box-shadow:0 0 10px var(--glow)}
 button:hover{background:var(--primary-hover)}
 .btn-sm{padding:.35rem .65rem;font-size:.75rem}
-.btn-outline{background:transparent;border:1px solid var(--border);color:var(--text)}
-.btn-outline:hover{background:var(--light);border-color:var(--muted)}
-.btn-ghost{background:transparent;color:var(--muted);padding:.35rem .65rem;font-size:.75rem}
+.btn-outline{background:transparent;border:1px solid var(--border2);color:var(--primary);box-shadow:none}
+.btn-outline:hover{background:var(--primary-soft)}
+.btn-ghost{background:transparent;color:var(--muted);padding:.35rem .65rem;font-size:.75rem;box-shadow:none}
 .btn-ghost:hover{background:var(--light)}
-.btn-danger{background:transparent;border:1px solid var(--danger);color:var(--danger)}
+.btn-danger{background:transparent;border:1px solid var(--danger);color:var(--danger);box-shadow:none}
 .btn-danger:hover{background:var(--danger-soft)}
-.btn-blue{background:transparent;border:1px solid var(--blue);color:var(--blue)}
+.btn-blue{background:transparent;border:1px solid var(--blue);color:var(--blue);box-shadow:none}
 .btn-blue:hover{background:var(--blue-soft)}
 .badge{display:inline-block;padding:.2rem .5rem;border-radius:6px;font-size:.65rem;font-weight:600;margin:.05rem}
 .badge-default{color:var(--text);background:var(--light)}
@@ -530,19 +528,19 @@ button:hover{background:var(--primary-hover)}
 .badge-yellow{color:var(--yellow);background:var(--yellow-soft)}
 .badge-red{color:var(--danger);background:var(--danger-soft)}
 .badge-green{color:var(--success);background:var(--success-soft)}
-input,textarea,select{width:100%;padding:.6rem .8rem;background:#fff;border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.85rem;margin-bottom:.5rem;font-family:inherit;transition:.2s}
-input:focus,textarea:focus,select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(79,70,229,.1)}
+input,textarea,select{width:100%;padding:.6rem .8rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.85rem;margin-bottom:.5rem;font-family:inherit;transition:.2s}
+input:focus,textarea:focus,select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-soft)}
 label.lbl{display:block;margin-bottom:.25rem;font-size:.75rem;color:var(--muted);font-weight:500}
 .grid{display:grid;gap:.75rem}@media(min-width:560px){.grid-2{grid-template-columns:1fr 1fr}}
-.toast{position:fixed;bottom:1.5rem;left:1.5rem;background:var(--text);color:#fff;padding:.75rem 1.25rem;border-radius:8px;font-weight:500;font-size:.85rem;opacity:0;transform:translateY(10px);transition:.3s;z-index:90;box-shadow:0 10px 15px -3px rgba(0,0,0,.1)}
+.toast{position:fixed;bottom:1.5rem;left:1.5rem;background:var(--primary);color:#000;padding:.75rem 1.25rem;border-radius:8px;font-weight:500;font-size:.85rem;opacity:0;transform:translateY(10px);transition:.3s;z-index:90;box-shadow:0 0 20px var(--glow)}
 .toast.show{opacity:1;transform:translateY(0)}
-.modal-bg{position:fixed;inset:0;background:rgba(15,23,42,.6);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;z-index:80;padding:1rem}
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.8);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;z-index:80;padding:1rem}
 .modal-bg.show{display:flex}
-.modal{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:1.5rem;max-width:480px;width:100%;max-height:92vh;overflow-y:auto;box-shadow:0 20px 25px -5px rgba(0,0,0,.1)}
-.modal h3{margin-bottom:1rem;font-size:1.1rem;font-weight:600}
+.modal{background:var(--card);border:1px solid var(--border2);border-radius:16px;padding:1.5rem;max-width:480px;width:100%;max-height:92vh;overflow-y:auto;box-shadow:0 0 30px var(--glow)}
+.modal h3{margin-bottom:1rem;font-size:1.1rem;font-weight:600;color:var(--primary)}
 .check-row{display:flex;align-items:center;gap:.5rem;margin-bottom:.5rem;font-size:.85rem;cursor:pointer}
 .check-row input{width:16px;height:16px;margin:0;accent-color:var(--primary)}
-.section-title{font-size:.85rem;font-weight:600;margin:.75rem 0 .5rem;padding-bottom:.5rem;border-bottom:1px solid var(--border)}
+.section-title{font-size:.85rem;font-weight:600;color:var(--primary);margin:.75rem 0 .5rem;padding-bottom:.5rem;border-bottom:1px solid var(--border)}
 .field-with-btn{display:flex;gap:.5rem;align-items:flex-start}
 .field-with-btn input,.field-with-btn textarea{flex:1;margin-bottom:0}
 .user-card{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:.75rem}
@@ -552,19 +550,20 @@ label.lbl{display:block;margin-bottom:.25rem;font-size:.75rem;color:var(--muted)
 .latency{font-size:.7rem;font-weight:600;color:var(--success);background:var(--success-soft);padding:.1rem .4rem;border-radius:4px}
 .client-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.75rem}
 .client-item{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:1rem;text-align:center;font-size:.75rem;transition:.2s}
-.client-item:hover{border-color:var(--primary);box-shadow:0 4px 6px -1px rgba(0,0,0,.05)}
+.client-item:hover{border-color:var(--primary);box-shadow:0 0 15px var(--glow)}
 .client-item strong{display:block;color:var(--primary);margin-bottom:.25rem;font-size:.85rem}
 .client-item a{color:var(--blue);font-size:.7rem;text-decoration:none}
 .hidden{display:none!important}
+.top-bar-actions{display:flex;gap:.5rem}
 </style>
 </head>
 <body>
 <div class="container">
   <div class="header">
     <div class="logo">APP Panel</div>
-    <div style="display:flex;gap:.5rem">
-      <button class="btn-ghost btn-sm" onclick="setLang('fa')">FA</button>
-      <button class="btn-ghost btn-sm" onclick="setLang('en')">EN</button>
+    <div class="top-bar-actions">
+      <a href="?lang=${isFa?'en':'fa'}&theme=${isDark?'dark':'dark'}" class="btn-ghost btn-sm">${isFa?'EN':'FA'}</a>
+      <a href="?lang=${lang}&theme=${isDark?'light':'dark'}" class="btn-ghost btn-sm">${isDark?'☀️':'🌙'}</a>
       <button class="btn-ghost btn-sm" onclick="logout()">${isFa ? 'خروج' : 'Logout'}</button>
     </div>
   </div>
@@ -743,13 +742,14 @@ label.lbl{display:block;margin-bottom:.25rem;font-size:.75rem;color:var(--muted)
 
 <script>
 const isFa = ${isFa ? 'true' : 'false'};
+const isDark = ${isDark ? 'true' : 'false'};
+const themeUrl = '?lang=${lang}&theme=${isDark?'light':'dark'}';
 let settings = {}, subs = [], users = [];
 let brainMode = 'proxy';
 
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2000)}
 function openModal(id){document.getElementById(id).classList.add('show')}
 function closeModal(id){document.getElementById(id).classList.remove('show')}
-function setLang(l){location.href='/panel?lang='+l}
 async function logout(){await fetch('/api/logout',{method:'POST'});location.reload()}
 
 document.querySelectorAll('.nav a[data-t]').forEach(a=>{
@@ -1141,6 +1141,7 @@ export default {
       const path = url.pathname;
       const host = url.hostname;
       const lang = url.searchParams.get('lang') || 'fa';
+      const theme = url.searchParams.get('theme') || 'dark';
 
       const upgrade = request.headers.get('Upgrade') || '';
       if (upgrade.toLowerCase() === 'websocket') {
@@ -1178,8 +1179,10 @@ export default {
             const usedGB = (usedBytes / 1024 / 1024 / 1024).toFixed(2);
             const totalGB = user.traffic > 0 ? user.traffic : '∞';
             const remainDays = user.expire ? Math.max(0, Math.ceil((new Date(user.expire) - new Date()) / 86400000)) : '∞';
+            const isDark = theme !== 'light';
+            const isFa = lang !== 'en';
             
-            return new Response(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Subscription Info</title><style>body{font-family:Inter,sans-serif;background:#f8fafc;color:#1e293b;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.box{background:#fff;padding:2rem;border-radius:16px;box-shadow:0 4px 6px rgba(0,0,0,.1);text-align:center;max-width:400px;width:90%}h1{color:#4f46e5;margin-bottom:1rem}.info{background:#f1f5f9;padding:1rem;border-radius:8px;margin:.5rem 0;text-align:left}.info strong{color:#64748b;display:block;font-size:.8rem}.info span{font-size:1.2rem;font-weight:700;color:#1e293b}.btn{display:inline-block;margin-top:1.5rem;padding:.8rem 1.5rem;background:#4f46e5;color:#fff;text-decoration:none;border-radius:8px;font-weight:600}</style></head><body><div class="box"><h1>APP Panel</h1><div class="info"><strong>Username</strong><span>${user.name}</span></div><div class="info"><strong>Traffic Usage</strong><span>${usedGB} / ${totalGB} GB</span></div><div class="info"><strong>Expiry Date</strong><span>${user.expire || 'Unlimited'}</span></div><div class="info"><strong>Remaining Days</strong><span>${remainDays}</span></div><a href="v2rayng://install-sub?url=${url.origin}/sub/${user.id}" class="btn">Import to v2rayNG</a></div></body></html>`, { headers: { 'Content-Type': 'text/html;charset=utf-8' }});
+            return new Response(`<!DOCTYPE html><html lang="${isFa ? 'fa' : 'en'}" dir="${isFa ? 'rtl' : 'ltr'}"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Subscription Info</title><style>@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700&family=Inter:wght@400;600;700&display=swap');:root{--bg:${isDark?'#030303':'#f8fafc'};--card:${isDark?'#0a0f0a':'#ffffff'};--text:${isDark?'#e8ffe8':'#1e293b'};--muted:${isDark?'#6b8f6b':'#64748b'};--primary:${isDark?'#00ff88':'#4f46e5'};--border:${isDark?'rgba(0,255,136,.15)':'#e2e8f0'};--glow:${isDark?'rgba(0,255,136,.35)':'rgba(79,70,229,.2)'}}*{box-sizing:border-box;margin:0;padding:0;font-family:${isFa?'Vazirmatn':'Inter'},sans-serif}body{background:var(--bg);color:var(--text);display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background-image:${isDark?'linear-gradient(rgba(0,255,136,.02) 1px,transparent 1px),linear-gradient(90deg,rgba(0,255,136,.02) 1px,transparent 1px)':'none'};background-size:40px 40px}.box{background:var(--card);padding:2rem;border-radius:16px;box-shadow:0 0 30px var(--glow);text-align:center;max-width:400px;width:90%;border:1px solid var(--border)}h1{color:var(--primary);margin-bottom:1rem;text-shadow:0 0 10px var(--glow)}.info{background:var(--bg);padding:1rem;border-radius:8px;margin:.5rem 0;text-align:right;border:1px solid var(--border)}.info strong{color:var(--muted);display:block;font-size:.8rem}.info span{font-size:1.2rem;font-weight:700;color:var(--text)}.btn{display:inline-block;margin-top:1.5rem;padding:.8rem 1.5rem;background:var(--primary);color:${isDark?'#000':'#fff'};text-decoration:none;border-radius:8px;font-weight:600;box-shadow:0 0 15px var(--glow)}.top-bar{position:fixed;top:1rem;left:1rem;display:flex;gap:.5rem}.tb-btn{background:var(--card);border:1px solid var(--border);color:var(--muted);padding:.35rem .65rem;border-radius:8px;cursor:pointer;font-size:.75rem;text-decoration:none}</style></head><body><div class="top-bar"><a href="?lang=${isFa?'en':'fa'}&theme=${isDark?'light':'dark'}" class="tb-btn">${isFa?'EN':'FA'}</a><a href="?lang=${lang}&theme=${isDark?'light':'dark'}" class="tb-btn">${isDark?'☀️':'🌙'}</a></div><div class="box"><h1>APP Panel</h1><div class="info"><strong>${isFa?'نام کاربری':'Username'}</strong><span>${user.name}</span></div><div class="info"><strong>${isFa?'مصرف ترافیک':'Traffic Usage'}</strong><span>${usedGB} / ${totalGB} GB</span></div><div class="info"><strong>${isFa?'تاریخ انقضا':'Expiry Date'}</strong><span>${user.expire || 'Unlimited'}</span></div><div class="info"><strong>${isFa?'روزهای باقی‌مانده':'Remaining Days'}</strong><span>${remainDays}</span></div><a href="v2rayng://install-sub?url=${url.origin}/sub/${user.id}" class="btn">${isFa?'افزودن به v2rayNG':'Import to v2rayNG'}</a></div></body></html>`, { headers: { 'Content-Type': 'text/html;charset=utf-8' }});
           }
 
           return new Response(generateUserSubContent(user, sub, settings, host), {
@@ -1220,9 +1223,9 @@ export default {
       }
 
       if (path === PANEL_PATH || path === PANEL_PATH + '/' || path === '/') {
-        if (path === '/') return redirect(`${url.origin}${PANEL_PATH}?lang=${lang}`);
+        if (path === '/') return redirect(`${url.origin}${PANEL_PATH}?lang=${lang}&theme=${theme}`);
         const authed = await checkAuth(request, env);
-        return html(getPanelHTML(lang, authed));
+        return html(getPanelHTML(lang, theme, authed));
       }
 
       return new Response('APP Panel is running.\nGo to /panel', {
