@@ -1,7 +1,7 @@
 /**
  * ═══════════════════════════════════════════════════════════════
- *   APP Panel  ·  Enterprise Proxy Panel  v3.1 (CORS & API Fix)
- *   رفع مشکل ذخیره نشدن کاربران و ساب‌لینک‌ها
+ *   APP Panel  ·  Enterprise Proxy Panel  v3.2 (D1 Diagnostics)
+ *   رفع قطعی ارتباط دیتابیس و نمایش دقیق خطاها
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -35,7 +35,7 @@ function base64ToArrayBuffer(base64Str) {
   }
 }
 
-// اصلاح هدرها برای رفع مشکل CORS و ذخیره نشدن اطلاعات
+// هدرهای استاندارد برای جلوگیری از مسدود شدن درخواست‌های مرورگر
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -44,18 +44,14 @@ function json(data, status = 200) {
       'Cache-Control': 'no-store',
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type'
+      'Access-Control-Allow-Headers': 'Content-Type, Accept'
     }
   });
 }
 
 function html(content) {
   return new Response(content, {
-    headers: { 
-      'Content-Type': 'text/html;charset=utf-8', 
-      'Cache-Control': 'no-store',
-      'Referrer-Policy': 'no-referrer'
-    }
+    headers: { 'Content-Type': 'text/html;charset=utf-8', 'Cache-Control': 'no-store' }
   });
 }
 
@@ -74,18 +70,23 @@ async function getSettings(env) {
     }
     return settings;
   } catch (e) {
+    console.error("DB Error getSettings:", e.message);
     return defaultSettings();
   }
 }
 
 async function saveSettings(env, data) {
   if (!env.APP_DB) return;
-  const stmt = env.APP_DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)");
-  const promises = [];
-  for (const [key, value] of Object.entries(data)) {
-    promises.push(stmt.bind(key, JSON.stringify(value)).run());
+  try {
+    const stmt = env.APP_DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)");
+    const promises = [];
+    for (const [key, value] of Object.entries(data)) {
+      promises.push(stmt.bind(key, JSON.stringify(value)).run());
+    }
+    await Promise.all(promises);
+  } catch (e) {
+    console.error("DB Error saveSettings:", e.message);
   }
-  await Promise.all(promises);
 }
 
 async function getSubs(env) {
@@ -96,7 +97,10 @@ async function getSubs(env) {
       id: row.id, name: row.name, traffic: row.traffic, maxUsers: row.maxUsers, days: row.days, port: row.port, path: row.path,
       protocols: JSON.parse(row.protocols || '{}'), proxyIP: row.proxyIP, cleanIPs: JSON.parse(row.cleanIPs || '[]'), routing: JSON.parse(row.routing || '{}')
     }));
-  } catch (e) { return []; }
+  } catch (e) {
+    console.error("DB Error getSubs:", e.message);
+    return [];
+  }
 }
 
 async function saveSub(env, sub) {
@@ -121,7 +125,10 @@ async function getUsers(env) {
     return results.map(row => ({
       id: row.id, name: row.name, uuid: row.uuid, used: row.used, traffic: row.traffic, expire: row.expire, maxDevices: row.maxDevices, subId: row.subId, note: row.note, enabled: row.enabled === 1
     }));
-  } catch (e) { return []; }
+  } catch (e) {
+    console.error("DB Error getUsers:", e.message);
+    return [];
+  }
 }
 
 async function saveUser(env, user) {
@@ -161,8 +168,12 @@ async function checkAuth(request, env) {
   if (!match) return false;
   const token = match[1];
   if (!env.APP_DB) return token.length > 8;
-  const session = await env.APP_DB.prepare("SELECT token FROM sessions WHERE token = ? AND expire > ?").bind(token, Date.now()).first();
-  return !!session;
+  try {
+    const session = await env.APP_DB.prepare("SELECT token FROM sessions WHERE token = ? AND expire > ?").bind(token, Date.now()).first();
+    return !!session;
+  } catch (e) {
+    return false;
+  }
 }
 
 async function createSession(env) {
@@ -534,7 +545,7 @@ input,textarea,select{width:100%;padding:.6rem .8rem;background:var(--bg);border
 input:focus,textarea:focus,select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px ${isDark?'rgba(0,255,136,.1)':'rgba(79,70,229,.1)'}}
 label.lbl{display:block;margin-bottom:.25rem;font-size:.75rem;color:var(--muted);font-weight:500}
 .grid{display:grid;gap:.75rem}@media(min-width:560px){.grid-2{grid-template-columns:1fr 1fr}}
-.toast{position:fixed;bottom:1.5rem;left:1.5rem;background:var(--primary);color:${isDark?'#000':'#fff'};padding:.75rem 1.25rem;border-radius:8px;font-weight:500;font-size:.85rem;opacity:0;transform:translateY(10px);transition:.3s;z-index:90;box-shadow:0 0 20px var(--glow)}
+.toast{position:fixed;bottom:1.5rem;left:1.5rem;background:var(--primary);color:${isDark?'#000':'#fff'};padding:.75rem 1.25rem;border-radius:8px;font-weight:500;font-size:.85rem;opacity:0;transform:translateY(10px);transition:.3s;z-index:90;box-shadow:0 0 20px var(--glow);max-width:90vw}
 .toast.show{opacity:1;transform:translateY(0)}
 .toast.err{background:var(--danger);color:#fff}
 .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.8);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;z-index:80;padding:1rem}
@@ -752,7 +763,7 @@ function toast(m, isErr=false){
   const t=document.getElementById('toast');
   t.textContent=m;
   t.className = 'toast show' + (isErr ? ' err' : '');
-  setTimeout(()=>t.className='toast', 3000);
+  setTimeout(()=>t.className='toast', 5000);
 }
 
 function openModal(id){document.getElementById(id).classList.add('show')}
@@ -769,17 +780,31 @@ document.querySelectorAll('.nav a[data-t]').forEach(a=>{
   }
 });
 
+async function apiFetch(url, options={}) {
+  try {
+    const r = await fetch(url, options);
+    if (!r.ok) {
+      let errMsg = 'HTTP Error ' + r.status;
+      try { const errData = await r.json(); if(errData.error) errMsg = errData.error; } catch {}
+      throw new Error(errMsg);
+    }
+    return await r.json();
+  } catch (e) {
+    throw new Error(e.message || 'Network Error');
+  }
+}
+
 async function loadAll(){
   try {
-    const [s,sb,u] = await Promise.all([
-      fetch('/api/settings').then(r=>r.json()),
-      fetch('/api/subs').then(r=>r.json()),
-      fetch('/api/users').then(r=>r.json())
+    const [s, sb, u] = await Promise.all([
+      apiFetch('/api/settings'),
+      apiFetch('/api/subs'),
+      apiFetch('/api/users')
     ]);
-    settings=s; subs=sb; users=u;
+    settings = s; subs = sb; users = u;
     render();
   } catch(e) {
-    toast(isFa?'خطا در بارگذاری اطلاعات':'Error loading data', true);
+    toast((isFa?'خطا در بارگذاری: ':'Load Error: ') + e.message, true);
   }
 }
 
@@ -895,8 +920,7 @@ async function saveSub(){
     routing: {adblock: document.getElementById('subAdblock').checked, iran: document.getElementById('subIran').checked}
   };
   try {
-    const r = await fetch('/api/subs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    if(!r.ok) throw new Error('Server responded '+r.status);
+    await apiFetch('/api/subs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     closeModal('modalSub');
     toast(isFa?'با موفقیت ذخیره شد':'Saved successfully');
     await loadAll();
@@ -907,11 +931,11 @@ async function saveSub(){
 async function delSub(id){
   if(!confirm(isFa?'آیا از حذف مطمئن هستید؟':'Are you sure?'))return;
   try {
-    await fetch('/api/subs?id='+id,{method:'DELETE'});
+    await apiFetch('/api/subs?id='+id,{method:'DELETE'});
     toast(isFa?'حذف شد':'Deleted');
     await loadAll();
   } catch(e) {
-    toast((isFa?'خطا در حذف':'Error deleting'), true);
+    toast((isFa?'خطا در حذف':'Error deleting')+': '+e.message, true);
   }
 }
 
@@ -921,8 +945,7 @@ async function openBrain(mode){
   document.getElementById('brainList').innerHTML = '<div class="muted" style="text-align:center">Loading...</div>';
   openModal('modalBrain');
   try {
-    const res = await fetch('/api/brain');
-    const data = await res.json();
+    const data = await apiFetch('/api/brain');
     if(data.error) throw new Error(data.error);
     document.getElementById('brainList').innerHTML = data.ips.map(b=>
       '<div class="brain-row"><div><strong>'+b.ip+'</strong></div><div style="display:flex;align-items:center;gap:.5rem"><span class="latency">'+b.ms+' ms</span>'+
@@ -983,8 +1006,7 @@ async function saveUser(){
     enabled:true
   };
   try {
-    const r=await fetch('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    if(!r.ok) throw new Error('Server responded '+r.status);
+    await apiFetch('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     closeModal('modalUser');
     toast(isFa?'کاربر ذخیره شد':'User saved');
     await loadAll();
@@ -995,20 +1017,20 @@ async function saveUser(){
 async function delUser(id){
   if(!confirm(isFa?'حذف کاربر؟':'Delete user?'))return;
   try {
-    await fetch('/api/users?id='+id,{method:'DELETE'});
+    await apiFetch('/api/users?id='+id,{method:'DELETE'});
     toast(isFa?'حذف شد':'Deleted');
     await loadAll();
   } catch(e) {
-    toast((isFa?'خطا در حذف':'Error deleting'), true);
+    toast((isFa?'خطا در حذف':'Error deleting')+': '+e.message, true);
   }
 }
 async function resetUser(id){
   try {
-    await fetch('/api/users/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+    await apiFetch('/api/users/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
     toast(isFa?'ترافیک ریست شد':'Traffic reset');
     await loadAll();
   } catch(e) {
-    toast('Error', true);
+    toast('Error: '+e.message, true);
   }
 }
 
@@ -1019,41 +1041,41 @@ async function saveSettings(){
     fragment:{length:document.getElementById('setFragLen').value,interval:document.getElementById('setFragInt').value,packets:'tlshello'}
   };
   try {
-    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    await apiFetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     toast(isFa?'تنظیمات ذخیره شد':'Settings saved');
     await loadAll();
   } catch(e) {
-    toast('Error', true);
+    toast('Error: '+e.message, true);
   }
 }
 async function newUUID(){
   try {
-    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({newUUID:true})});
+    await apiFetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({newUUID:true})});
     toast('New UUID generated');
     await loadAll();
   } catch(e) {
-    toast('Error', true);
+    toast('Error: '+e.message, true);
   }
 }
 async function changePass(){
   const p=document.getElementById('newPass').value;
   if(!p||p.length<4){toast(isFa?'حداقل ۴ کاراکتر':'Min 4 chars');return}
   try {
-    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p})});
+    await apiFetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p})});
     toast(isFa?'رمز تغییر کرد':'Password changed');
     document.getElementById('newPass').value='';
   } catch(e) {
-    toast('Error', true);
+    toast('Error: '+e.message, true);
   }
 }
 async function saveWarp(){
   try {
-    await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    await apiFetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
       warp:{enabled:document.getElementById('warpOn').checked,pro:document.getElementById('warpPro').checked,endpoint:document.getElementById('warpEndpoint').value}
     })});
     toast(isFa?'ذخیره شد':'Saved');
   } catch(e) {
-    toast('Error', true);
+    toast('Error: '+e.message, true);
   }
 }
 
@@ -1073,7 +1095,7 @@ async function handleAPI(request, env, path) {
       headers: {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type'
+        'Access-Control-Allow-Headers': 'Content-Type, Accept'
       }
     });
   }
